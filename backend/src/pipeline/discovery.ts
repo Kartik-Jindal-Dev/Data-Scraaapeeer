@@ -7,17 +7,17 @@
  *
  * Strategy (Tier 2.1 — inline list extraction):
  * 1. Navigate to Google Maps search URL.
- * 2. Wait for the results feed ([role="feed"]).
+ * 2. Wait for the results feed using multiple selector fallbacks.
  * 3. Scroll the feed to load up to MAX_LEADS results.
- * 4. Extract name, address, phone, website DIRECTLY from the list items —
- *    no per-place navigation needed for most results.
- * 5. For results missing both phone AND website, click through to the detail
- *    panel as a fallback (typically ~20–30% of results).
+ * 4. Extract name, address, phone, website DIRECTLY from the list items.
+ * 5. For results missing both phone AND website, click through to the detail panel.
  * 6. Apply delay only between fallback detail-panel navigations.
  * 7. Detect CAPTCHA — if found, increment metric, emit SSE error, stop safely.
  *
- * This approach eliminates ~70–80% of per-place page navigations compared to
- * the previous strategy, cutting discovery time by 60–80%.
+ * Feed selector fallback strategy:
+ * Google occasionally changes the Maps DOM. The scraper tries multiple known
+ * selectors in parallel and uses whichever one appears first. If none match,
+ * it retries once with a different URL format before giving up.
  *
  * CONSTRAINTS:
  * - Do NOT filter leads here — all raw leads pass through to deduplicator.
@@ -31,6 +31,7 @@ import { store } from '../store';
 import { emitError, emitStatus } from '../sse';
 import { RawLead } from '../types';
 import { createStealthBrowser } from './antiBlocking';
+import { searchSerper, convertToRawLeads, validateSerperResults } from './serper';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -39,6 +40,30 @@ const BASE_DELAY_MS = parseInt(process.env.REQUEST_DELAY_MS ?? '500', 10);
 const JITTER_MS = parseInt(process.env.REQUEST_DELAY_JITTER_MS ?? '200', 10);
 const FEED_TIMEOUT_MS = 20_000;
 const SCROLL_PAUSE_MS = 1_200;
+
+// Maps discovery cap: how many results to scroll to per city.
+// Serper mode ignores this (controlled by SERPER_RESULTS_PER_QUERY).
+// Maps mode: 30 is enough — after dedup removes directory sites you get ~15–20
+// real businesses. Scrolling to 100+ wastes 40–60 extra seconds per city.
+const MAPS_RESULTS_CAP = parseInt(process.env.MAPS_RESULTS_CAP ?? '30', 10);
+
+/**
+ * Ordered list of CSS selectors that may contain the Maps results feed.
+ * Tried in parallel — whichever resolves first is used for the entire run.
+ *
+ * 1. [role="feed"]                — standard ARIA feed (current Maps layout)
+ * 2. div[aria-label*="Results for"] — alternate ARIA label in some locales
+ * 3. div[aria-label*="results"]   — lowercase variant
+ * 4. .m6QErb[aria-label]          — Maps-specific class in some A/B variants
+ * 5. #QA0Szd                      — outer panel container (last resort)
+ */
+const FEED_SELECTORS = [
+  '[role="feed"]',
+  'div[aria-label*="Results for"]',
+  'div[aria-label*="results"]',
+  '.m6QErb[aria-label]',
+  '#QA0Szd',
+];
 
 // ─── Shared Browser State ─────────────────────────────────────────────────────
 
@@ -78,7 +103,37 @@ function normaliseUrl(raw: string): string {
   if (!url.startsWith('http://') && !url.startsWith('https://')) {
     url = `https://${url}`;
   }
-  return url.replace(/\/$/, '');
+  url = url.replace(/\/$/, '');
+
+  // Filter out Google Ads click-tracking URLs (/aclk) and other non-business URLs.
+  // These appear when Maps shows sponsored results — they redirect to the real site
+  // but the redirect target is unpredictable and wastes a browser slot.
+  const BLOCKED_URL_PATTERNS = [
+    'google.com/aclk',
+    'google.com/pagead',
+    'googleadservices.com',
+    'doubleclick.net',
+    'facebook.com',
+    'instagram.com',
+    'twitter.com',
+    'linkedin.com',
+    'youtube.com',
+    'yelp.com',
+    'bbb.org',
+    'reddit.com',
+    'yellowpages.com',
+    'homestars.com',
+    'bark.com',
+    'houzz.com',
+    'thumbtack.com',
+    'angi.com',
+    'angieslist.com',
+    'homeadvisor.com',
+  ];
+
+  if (BLOCKED_URL_PATTERNS.some((p) => url.includes(p))) return '';
+
+  return url;
 }
 
 // ─── CAPTCHA Detection ────────────────────────────────────────────────────────
@@ -120,82 +175,151 @@ async function dismissConsentDialog(page: Page): Promise<void> {
   }
 }
 
-// ─── Inline List Extraction (Tier 2.1) ───────────────────────────────────────
+// ─── Feed Selector Helpers ────────────────────────────────────────────────────
+
+/**
+ * Waits for any of the known feed selectors to appear on the page.
+ * Runs all selectors in parallel — returns the first one that resolves.
+ * Returns null if none appear within timeoutMs.
+ */
+async function waitForFeed(page: Page, timeoutMs: number): Promise<string | null> {
+  const results = await Promise.all(
+    FEED_SELECTORS.map((sel) =>
+      page.waitForSelector(sel, { timeout: timeoutMs })
+        .then(() => sel)
+        .catch(() => null as string | null)
+    )
+  );
+  return results.find((r) => r !== null) ?? null;
+}
+
+/**
+ * Scrolls the feed element identified by feedSelector.
+ * Falls back to window.scrollBy if the element is not found.
+ */
+async function scrollFeed(page: Page, feedSelector: string): Promise<void> {
+  await page.evaluate((sel) => {
+    const feed = document.querySelector(sel);
+    if (feed) feed.scrollBy(0, 1000);
+    else window.scrollBy(0, 1000);
+  }, feedSelector);
+}
+
+/**
+ * Counts result cards inside the feed.
+ * Tries direct div children first, then place-link anchors as a fallback.
+ */
+async function countFeedItems(page: Page, feedSelector: string): Promise<number> {
+  return page.evaluate((sel) => {
+    const feed = document.querySelector(sel);
+    if (!feed) return 0;
+    const direct = feed.querySelectorAll(':scope > div');
+    if (direct.length > 0) return direct.length;
+    return feed.querySelectorAll('a[href*="/maps/place/"]').length;
+  }, feedSelector).catch(() => 0);
+}
+
+/**
+ * Phase 3.4: Waits for feed item count to stabilize after a scroll.
+ * Polls every 200ms until count stops changing or maxWaitMs is reached.
+ * Returns the final stable count.
+ */
+async function waitForFeedStable(
+  page: Page,
+  feedSelector: string,
+  prevCount: number,
+  maxWaitMs: number
+): Promise<number> {
+  const startTime = Date.now();
+  let currentCount = prevCount;
+  let stableCount = prevCount;
+  let stableFor = 0;
+
+  while (Date.now() - startTime < maxWaitMs) {
+    await page.waitForTimeout(200);
+    currentCount = await countFeedItems(page, feedSelector);
+
+    if (currentCount === stableCount) {
+      stableFor += 200;
+      if (stableFor >= 600) {
+        // Stable for 600ms — consider it done
+        return currentCount;
+      }
+    } else {
+      stableCount = currentCount;
+      stableFor = 0;
+    }
+  }
+
+  return currentCount;
+}
+
+// ─── Inline List Extraction ───────────────────────────────────────────────────
 
 interface InlineResult {
   name: string;
   address: string;
   rawPhone: string;
   website: string;
-  placeUrl: string; // canonical /maps/place/ URL for fallback navigation
+  placeUrl: string;
 }
 
 /**
  * Extracts all available data directly from the Maps search results list.
- * No page navigation required — reads the already-rendered DOM.
- *
- * Returns one entry per result card. Fields may be empty if not shown inline
- * (phone and website are sometimes absent from the list view).
+ * Works with any feed selector variant — no hardcoded [role="feed"].
  */
-async function extractFromList(page: Page): Promise<InlineResult[]> {
-  return page.$$eval('[role="feed"] > div', (cards) => {
+async function extractFromList(page: Page, feedSelector: string): Promise<InlineResult[]> {
+  return page.evaluate((sel) => {
+    const feed = document.querySelector(sel);
+    if (!feed) return [];
+
+    // Collect card elements — direct div children first, then place-link ancestors
+    let cards: Element[] = Array.from(feed.querySelectorAll(':scope > div'));
+    if (cards.length === 0) {
+      const placeLinks = Array.from(feed.querySelectorAll('a[href*="/maps/place/"]'));
+      const seen = new Set<Element>();
+      for (const link of placeLinks) {
+        const ancestor = link.closest('[jsaction]') ?? link.parentElement ?? link;
+        if (!seen.has(ancestor)) { seen.add(ancestor); cards.push(ancestor); }
+      }
+    }
+
     const results: Array<{
-      name: string;
-      address: string;
-      rawPhone: string;
-      website: string;
-      placeUrl: string;
+      name: string; address: string; rawPhone: string; website: string; placeUrl: string;
     }> = [];
 
     for (const card of cards) {
-      // ── Name ──────────────────────────────────────────────────────────────
       const name =
         card.querySelector('.fontHeadlineSmall')?.textContent?.trim() ||
         card.querySelector('[class*="fontHeadline"]')?.textContent?.trim() ||
         card.querySelector('span[aria-label]')?.getAttribute('aria-label')?.trim() ||
+        card.querySelector('h3')?.textContent?.trim() ||
         '';
 
       if (!name || name.toLowerCase() === 'results') continue;
 
-      // ── Address ───────────────────────────────────────────────────────────
-      // Address is typically in the second W4Efsd span group
       const addressSpans = card.querySelectorAll('.W4Efsd span');
       let address = '';
       for (const span of Array.from(addressSpans)) {
         const text = span.textContent?.trim() ?? '';
-        // Address spans contain · separators; pick the one that looks like an address
         if (text && !text.startsWith('·') && text.length > 5 && /\d|road|street|sector|nagar|colony|block/i.test(text)) {
-          address = text;
-          break;
+          address = text; break;
         }
       }
-      // Fallback: just grab all W4Efsd text
-      if (!address) {
-        address = card.querySelector('.W4Efsd')?.textContent?.trim() ?? '';
-      }
+      if (!address) address = card.querySelector('.W4Efsd')?.textContent?.trim() ?? '';
 
-      // ── Phone ─────────────────────────────────────────────────────────────
-      // Phone is sometimes shown inline as a span with a phone icon sibling
       let rawPhone = '';
-      const allSpans = card.querySelectorAll('span');
-      for (const span of Array.from(allSpans)) {
+      for (const span of Array.from(card.querySelectorAll('span'))) {
         const text = span.textContent?.trim() ?? '';
-        // Match phone-like patterns: starts with digit/+, 7–15 chars of digits/spaces/dashes
-        if (/^[+\d][\d\s\-().]{6,14}$/.test(text)) {
-          rawPhone = text;
-          break;
-        }
+        if (/^[+\d][\d\s\-().]{6,14}$/.test(text)) { rawPhone = text; break; }
       }
 
-      // ── Website ───────────────────────────────────────────────────────────
-      // Website link is an <a> with data-item-id="authority" or aria-label containing "website"
       const websiteAnchor =
         (card.querySelector('a[data-item-id="authority"]') as HTMLAnchorElement | null) ||
         (card.querySelector('a[aria-label*="website" i]') as HTMLAnchorElement | null) ||
         (card.querySelector('a[aria-label*="Website"]') as HTMLAnchorElement | null);
       const website = websiteAnchor?.href ?? '';
 
-      // ── Place URL (for fallback navigation) ───────────────────────────────
       const placeAnchor = card.querySelector('a[href*="/maps/place/"]') as HTMLAnchorElement | null;
       const placeUrl = placeAnchor?.href ?? '';
 
@@ -203,15 +327,11 @@ async function extractFromList(page: Page): Promise<InlineResult[]> {
     }
 
     return results;
-  }).catch(() => []);
+  }, feedSelector).catch(() => []);
 }
 
 // ─── Detail Panel Extraction (fallback for missing phone/website) ─────────────
 
-/**
- * Navigates to a place URL and extracts the full detail panel.
- * Only called for results where inline extraction yielded no phone AND no website.
- */
 async function extractFromDetailPanel(
   page: Page,
   placeUrl: string
@@ -248,10 +368,58 @@ export async function discoverLeads(
 ): Promise<RawLead[]> {
   const rawLeads: RawLead[] = [];
   const searchQuery = encodeURIComponent(`${keyword} ${location}`);
-  const mapsUrl = `https://www.google.com/maps/search/${searchQuery}`;
+  
+  // Start timing for observability
+  const discoveryStartTime = Date.now();
+
+  // Two URL formats to try — the /search/ path and the ?q= query param format
+  const urlFormats = [
+    `https://www.google.com/maps/search/${searchQuery}`,
+    `https://www.google.com/maps/search/?q=${searchQuery}&hl=en`,
+  ];
 
   logger.info(`Discovery: starting — keyword="${keyword}" location="${location}"`);
-  logger.info(`Discovery: URL = ${mapsUrl}`);
+
+  // ── Phase 1: Try Serper API first (if enabled) ──────────────────────────────
+  const SERPER_ENABLED = process.env.SERPER_ENABLED === 'true';
+  const SERPER_RESULTS_PER_QUERY = parseInt(process.env.SERPER_RESULTS_PER_QUERY || '20', 10);
+  const MIN_SERPER_RESULTS = Math.min(5, SERPER_RESULTS_PER_QUERY / 4);
+
+  if (SERPER_ENABLED) {
+    try {
+      logger.info(`Discovery: trying Serper API for "${keyword} ${location}"`);
+      const serperStartTime = Date.now();
+      
+      // Format query as "keyword city country" for Serper
+      const serperQuery = `${keyword} ${location}`;
+      const serperResults = await searchSerper(serperQuery);
+      
+      const serperDuration = Date.now() - serperStartTime;
+      logger.info(`Discovery: Serper request took ${serperDuration}ms`);
+      
+      if (validateSerperResults(serperResults, MIN_SERPER_RESULTS)) {
+        const serperLeads = convertToRawLeads(serperResults);
+        store.incrementMetric('serper_results_used');
+        
+        const totalDuration = Date.now() - discoveryStartTime;
+        logger.info(`Discovery: Serper successful — ${serperLeads.length} leads found in ${totalDuration}ms`);
+        return serperLeads;
+      } else {
+        // Serper failed or insufficient results
+        store.incrementMetric('serper_fallbacks');
+        logger.info(`Discovery: Serper failed or insufficient results after ${serperDuration}ms — falling back to Maps`);
+      }
+    } catch (error) {
+      // Serper request failed
+      store.incrementMetric('serper_fallbacks');
+      logger.warn(`Discovery: Serper error — ${error instanceof Error ? error.message : 'unknown error'}`);
+      logger.info('Discovery: falling back to Maps due to Serper error');
+    }
+  } else {
+    logger.info('Discovery: Serper disabled via SERPER_ENABLED=false');
+  }
+
+  // ── Phase 2: Fall back to Google Maps Playwright scraper ───────────────────
 
   const { browser, context } = await createStealthBrowser();
   activeBrowser = browser;
@@ -260,26 +428,53 @@ export async function discoverLeads(
   const page = await activeContext.newPage();
 
   try {
-    await page.goto(mapsUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-    await page.waitForTimeout(1_500);
+    let feedSelector: string | null = null;
 
-    await dismissConsentDialog(page);
+    // ── Try each URL format until a feed is found ─────────────────────────────
+    for (let urlIdx = 0; urlIdx < urlFormats.length; urlIdx++) {
+      const mapsUrl = urlFormats[urlIdx];
+      logger.info(`Discovery: navigating to ${mapsUrl}`);
 
-    if (await isCaptchaPage(page)) {
-      store.incrementMetric('captcha_blocked');
-      emitError(jobId, { message: 'CAPTCHA detected on Google Maps. Try again later or use a different IP.' });
-      logger.warn('Discovery: CAPTCHA detected on initial load — aborting');
-      return rawLeads;
-    }
+      await page.goto(mapsUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+      await page.waitForTimeout(1_500);
 
-    // ── Wait for results feed ─────────────────────────────────────────────────
-    try {
-      await page.waitForSelector('[role="feed"]', { timeout: FEED_TIMEOUT_MS });
-    } catch {
+      await dismissConsentDialog(page);
+
+      if (await isCaptchaPage(page)) {
+        store.incrementMetric('captcha_blocked');
+        emitError(jobId, { message: 'CAPTCHA detected on Google Maps. Try again later or use a different IP.' });
+        logger.warn('Discovery: CAPTCHA detected on initial load — aborting');
+        return rawLeads;
+      }
+
+      // Try all known feed selectors in parallel
+      logger.info(`Discovery: waiting for results feed (attempt ${urlIdx + 1}/${urlFormats.length})...`);
+      feedSelector = await waitForFeed(page, FEED_TIMEOUT_MS);
+
+      if (feedSelector) {
+        logger.info(`Discovery: feed found with selector "${feedSelector}"`);
+        break;
+      }
+
+      // Log diagnostic info before retrying
       const currentUrl = page.url();
       const title = await page.title().catch(() => 'unknown');
-      logger.warn(`Discovery: results feed not found — URL="${currentUrl}" title="${title}"`);
-      emitError(jobId, { message: 'Google Maps results feed not found. The page structure may have changed.' });
+      logger.warn(`Discovery: no feed found on attempt ${urlIdx + 1} — URL="${currentUrl}" title="${title}"`);
+
+      if (urlIdx < urlFormats.length - 1) {
+        logger.info('Discovery: retrying with alternate URL format...');
+        await page.waitForTimeout(2_000);
+      }
+    }
+
+    // ── All URL formats exhausted — give up ───────────────────────────────────
+    if (!feedSelector) {
+      const currentUrl = page.url();
+      const title = await page.title().catch(() => 'unknown');
+      logger.warn(`Discovery: results feed not found after all attempts — URL="${currentUrl}" title="${title}"`);
+      emitError(jobId, {
+        message: 'Google Maps results feed not found. This may be a temporary block or a DOM change. Try again in a few minutes.',
+      });
       return rawLeads;
     }
 
@@ -288,46 +483,66 @@ export async function discoverLeads(
     let prevCount = 0;
     let noNewResultsStreak = 0;
 
+    // Phase 3.4: Dynamic scroll waiting (feature-flagged via DYNAMIC_WAITS_ENABLED)
+    // When enabled: waits for DOM stabilization instead of a fixed pause.
+    // When disabled (default): uses fixed SCROLL_PAUSE_MS for safety.
+    // Requirement: only enable after Serper fallback stability validation.
+    const DYNAMIC_WAITS_ENABLED = process.env.DYNAMIC_WAITS_ENABLED === 'true';
+
     while (!stopSignal.stopped) {
-      await page.evaluate(() => {
-        const feed = document.querySelector('[role="feed"]');
-        if (feed) feed.scrollBy(0, 1000);
-      });
-      await page.waitForTimeout(SCROLL_PAUSE_MS + Math.floor(Math.random() * 200));
+      await scrollFeed(page, feedSelector);
 
-      const currentCount = await page
-        .$$eval('[role="feed"] > div', (els) => els.length)
-        .catch(() => 0);
-
-      if (currentCount === prevCount) {
-        noNewResultsStreak++;
-        if (noNewResultsStreak >= 3) {
-          logger.info(`Discovery: no new results after ${noNewResultsStreak} scrolls — stopping scroll`);
-          break;
+      if (DYNAMIC_WAITS_ENABLED) {
+        // Dynamic wait: poll feed item count until stable (max 3s)
+        const stableCount = await waitForFeedStable(page, feedSelector, prevCount, 3_000);
+        if (stableCount === prevCount) {
+          noNewResultsStreak++;
+        } else {
+          noNewResultsStreak = 0;
         }
+        prevCount = stableCount;
       } else {
-        noNewResultsStreak = 0;
+        // Fixed pause (safe default)
+        await page.waitForTimeout(SCROLL_PAUSE_MS + Math.floor(Math.random() * 200));
+        const currentCount = await countFeedItems(page, feedSelector);
+        if (currentCount === prevCount) {
+          noNewResultsStreak++;
+        } else {
+          noNewResultsStreak = 0;
+        }
+        prevCount = currentCount;
       }
-      prevCount = currentCount;
-      if (currentCount >= MAX_LEADS) break;
+
+      if (noNewResultsStreak >= 3) {
+        logger.info(`Discovery: no new results after ${noNewResultsStreak} scrolls — stopping scroll`);
+        break;
+      }
+      if (prevCount >= MAPS_RESULTS_CAP) {
+        logger.info(`Discovery: reached Maps results cap (${MAPS_RESULTS_CAP}) — stopping scroll`);
+        break;
+      }
     }
 
-    // ── Step 1: Extract inline from list (Tier 2.1 — no navigation needed) ───
+    // ── Extract inline from list ──────────────────────────────────────────────
     logger.info('Discovery: extracting data from list...');
-    const inlineResults = await extractFromList(page);
+    const inlineResults = await extractFromList(page, feedSelector);
     logger.info(`Discovery: extracted ${inlineResults.length} results from list`);
 
     if (inlineResults.length === 0) {
-      const feedInfo = await page.$$eval('[role="feed"] > div', (divs) =>
-        divs.slice(0, 2).map((d) => d.className + ' | ' + d.innerHTML.slice(0, 120))
-      ).catch(() => ['could not read feed']);
-      logger.warn(`Discovery: 0 inline results. Feed sample: ${JSON.stringify(feedInfo)}`);
+      // Log a sample of the feed HTML for debugging
+      const feedSample = await page.evaluate((sel) => {
+        const feed = document.querySelector(sel);
+        if (!feed) return 'feed element not found';
+        const children = Array.from(feed.children).slice(0, 2);
+        return children.map((c) => c.className + ' | ' + c.innerHTML.slice(0, 120)).join('\n');
+      }, feedSelector).catch(() => 'could not read feed');
+      logger.warn(`Discovery: 0 inline results. Feed sample:\n${feedSample}`);
       emitError(jobId, { message: 'No business listings found on Google Maps for this search.' });
       return rawLeads;
     }
 
-    // ── Step 2: Process results — use inline data, fallback for missing fields ─
-    const toProcess = inlineResults.slice(0, MAX_LEADS);
+    // ── Process results ───────────────────────────────────────────────────────
+    const toProcess = inlineResults.slice(0, MAPS_RESULTS_CAP);
     let fallbackCount = 0;
 
     for (let i = 0; i < toProcess.length && rawLeads.length < MAX_LEADS; i++) {
@@ -346,7 +561,7 @@ export async function discoverLeads(
       const inline = toProcess[i];
       let { rawPhone, website } = inline;
 
-      // ── Fallback: navigate to detail panel only if both phone AND website missing
+      // Fallback: navigate to detail panel only if both phone AND website are missing
       if (!rawPhone && !website && inline.placeUrl) {
         fallbackCount++;
         logger.info(`Discovery: fallback navigation for "${inline.name}" (${fallbackCount} fallbacks so far)`);
@@ -357,7 +572,6 @@ export async function discoverLeads(
           website = detail.website || website;
         }
 
-        // Small delay only after fallback navigations
         await randomDelay();
       }
 
@@ -380,8 +594,9 @@ export async function discoverLeads(
       }
     }
 
+    const mapsDuration = Date.now() - discoveryStartTime;
     logger.info(
-      `Discovery: complete — ${rawLeads.length} raw leads (${fallbackCount} required fallback navigation)`
+      `Discovery: complete — ${rawLeads.length} raw leads (${fallbackCount} required fallback navigation) in ${mapsDuration}ms`
     );
     return rawLeads;
   } finally {

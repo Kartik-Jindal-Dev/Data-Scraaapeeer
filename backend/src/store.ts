@@ -17,6 +17,7 @@ import {
   JobStatus,
   Lead,
   ScrapeDepth,
+  ContactFilter,
   StoreStats,
 } from './types';
 
@@ -38,6 +39,10 @@ let failureMetrics: FailureMetrics = {
   duplicate_skipped: 0,
   captcha_blocked: 0,
   subpages_scraped: 0,
+  serper_queries: 0,
+  serper_failures: 0,
+  serper_fallbacks: 0,
+  serper_results_used: 0,
 };
 
 // ─── Store API ────────────────────────────────────────────────────────────────
@@ -62,18 +67,25 @@ export const store = {
       duplicate_skipped: 0,
       captcha_blocked: 0,
       subpages_scraped: 0,
+      serper_queries: 0,
+      serper_failures: 0,
+      serper_fallbacks: 0,
+      serper_results_used: 0,
     };
   },
 
   /**
    * Initialises a new job context.
-   * Generates a UUID jobId and stores keyword, location, depth, and ISO country code.
+   * Generates a UUID jobId and stores keyword, location, depth, ISO country code,
+   * contact filter mode, and maxLeads target.
    */
   initJob(
     keyword: string,
     location: string,
     depth: ScrapeDepth,
-    isoCountryCode: string
+    isoCountryCode: string,
+    contactFilter: ContactFilter = 'any',
+    maxLeads = 100
   ): JobContext {
     const ctx: JobContext = {
       jobId: uuidv4(),
@@ -81,6 +93,8 @@ export const store = {
       location,
       depth,
       isoCountryCode,
+      contactFilter,
+      maxLeads,
     };
     jobContext = ctx;
     return ctx;

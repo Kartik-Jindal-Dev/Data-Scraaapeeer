@@ -1,0 +1,2270 @@
+﻿
+
+===== backend/src/routes/start.ts =====
+
+
+
+===== backend/src/pipeline/cityPool.ts =====
+
+
+
+===== backend/src/types.ts =====
+
+
+
+===== src/routes/start.ts =====
+
+/**
+ * routes/start.ts
+ * POST /api/start
+ *
+ * Phase 13 â€” Keyword Rule (1 Keyword):
+ * - Accepts exactly 1 keyword per run (profession â†’ primary keyword).
+ * - Accepts country + states[] for city-batched execution (Phase 14).
+ * - Accepts maxLeads as the single stop condition.
+ * - Backward compatible: plain `location` string still accepted for
+ *   single-location runs (existing integrations unaffected).
+ *
+ * FREE STACK: Nominatim for geocoding (legacy mode only). Playwright for discovery.
+ * City-batched mode uses country-state-city + GeoNames â€” no Nominatim needed.
+ *
+ * CONSTRAINTS:
+ * - Exactly 1 keyword per run â€” no expansion, no matrix.
+ * - store.reset() is called at the start of every new job.
+ * - A running job must be stopped before a new one can start.
+ * - pipeline.ts executes a single job only â€” batching/stop owned by this controller.
+ */
+
+import { Request, Response, Router } from 'express';
+import { logger } from '../logger';
+import { store } from '../store';
+import { ContactFilter, JobContext, ScrapeDepth } from '../types';
+import { geocodeLocation } from '../pipeline/geocoder';
+import { resolveCountryIso } from '../pipeline/cityPool';
+import { isCityVisited, markCityVisited } from '../pipeline/visitedCities';
+import { runPipeline, resetStopSignal, signalStop, stopSignal } from '../pipeline/pipeline';
+import { startRateLimiter } from '../middleware/rateLimiter';
+
+export const startRouter = Router();
+
+// Apply rate limiter to POST /api/start (5 requests/minute/IP)
+startRouter.use(startRateLimiter);
+
+// â”€â”€â”€ Config â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+const DEFAULT_MAX_LEADS = parseInt(process.env.MAX_LEADS ?? '100', 10);
+const CITY_BATCH_SIZE = parseInt(process.env.CITY_BATCH_SIZE ?? '5', 10);
+const INTER_JOB_DELAY_MS = parseInt(process.env.INTER_JOB_DELAY_MS ?? '0', 10);
+
+// Phase 5.1: parallel city execution
+// Max concurrent city jobs. Dedup is concurrency-safe (per-key mutex in deduplicator.ts).
+// Browser contention and CAPTCHA risk increase with parallelism â€” start at 2.
+const PARALLEL_CITIES_ENABLED = process.env.PARALLEL_CITIES_ENABLED === 'true';
+const PARALLEL_CITIES_MAX = Math.min(
+  Math.max(1, parseInt(process.env.PARALLEL_CITIES_MAX ?? '2', 10)),
+  4 // hard cap: 4 concurrent city jobs max to avoid browser/memory saturation
+);
+
+// â”€â”€â”€ Request Body Shape â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+interface StartRequestBody {
+  // Phase 13: single keyword
+  keyword?: unknown;
+
+  // Phase 12: country + states for city-batched runs
+  country?: unknown;
+  states?: unknown;
+
+  // Backward compat: plain location string (single-location runs)
+  location?: unknown;
+  locations?: unknown;
+
+  // Stop condition
+  maxLeads?: unknown;
+
+  // Scraping options
+  depth?: unknown;
+  contactFilter?: unknown;
+}
+
+// â”€â”€â”€ Input Validation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+interface ValidatedInput {
+  keyword: string;
+  // City-batched mode: country + states[]
+  country: string | null;
+  states: string[];
+  // Legacy single-location mode: resolved location strings
+  locations: string[];
+  depth: ScrapeDepth;
+  contactFilter: ContactFilter;
+  maxLeads: number;
+  mode: 'city_batched' | 'legacy';
+}
+
+function validateStartBody(
+  body: StartRequestBody
+): { valid: true } & ValidatedInput | { valid: false; error: string } {
+  const { keyword, country, states, location, locations, depth, contactFilter, maxLeads } = body;
+
+  // â”€â”€ Keyword: exactly 1 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  let kw: string;
+  if (typeof keyword === 'string' && keyword.trim().length > 0) {
+    kw = keyword.trim();
+  } else {
+    return { valid: false, error: 'keyword is required and must be a non-empty string. Exactly 1 keyword per run.' };
+  }
+
+  // â”€â”€ maxLeads â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  let maxLeadsValue = DEFAULT_MAX_LEADS;
+  if (maxLeads !== undefined) {
+    const parsed = parseInt(String(maxLeads), 10);
+    if (isNaN(parsed) || parsed < 1) {
+      return { valid: false, error: 'maxLeads must be a positive integer.' };
+    }
+    maxLeadsValue = parsed;
+  }
+
+  // â”€â”€ Depth â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  const depthValue = depth ?? 'homepage';
+  if (depthValue !== 'homepage' && depthValue !== 'indepth') {
+    return { valid: false, error: 'depth must be "homepage" or "indepth"' };
+  }
+
+  // â”€â”€ Contact filter â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  const validFilters: ContactFilter[] = ['any', 'email_only', 'phone_only', 'both'];
+  const filterValue = (contactFilter ?? 'any') as ContactFilter;
+  if (!validFilters.includes(filterValue)) {
+    return { valid: false, error: 'contactFilter must be "any", "email_only", "phone_only", or "both"' };
+  }
+
+  // â”€â”€ Mode: city_batched (country + states) vs legacy (location string) â”€â”€â”€â”€
+  if (country !== undefined || states !== undefined) {
+    // City-batched mode
+    if (typeof country !== 'string' || country.trim().length === 0) {
+      return { valid: false, error: 'country is required when using states-based city batching.' };
+    }
+    let statesArray: string[] = [];
+    if (Array.isArray(states)) {
+      statesArray = states
+        .filter((s): s is string => typeof s === 'string' && s.trim().length > 0)
+        .map((s) => s.trim());
+    } else if (typeof states === 'string' && states.trim().length > 0) {
+      statesArray = [states.trim()];
+    }
+    if (statesArray.length === 0) {
+      return { valid: false, error: 'At least one state/region is required for city-batched mode.' };
+    }
+    return {
+      valid: true,
+      keyword: kw,
+      country: country.trim(),
+      states: statesArray,
+      locations: [],
+      depth: depthValue as ScrapeDepth,
+      contactFilter: filterValue,
+      maxLeads: maxLeadsValue,
+      mode: 'city_batched',
+    };
+  }
+
+  // Legacy mode: plain location string(s)
+  let locArray: string[];
+  if (Array.isArray(locations)) {
+    locArray = locations
+      .filter((l): l is string => typeof l === 'string' && l.trim().length > 0)
+      .map((l) => l.trim());
+  } else if (typeof location === 'string' && location.trim().length > 0) {
+    locArray = [location.trim()];
+  } else if (typeof locations === 'string' && (locations as string).trim().length > 0) {
+    locArray = [(locations as string).trim()];
+  } else {
+    return {
+      valid: false,
+      error: 'Provide either (country + states[]) for city-batched mode, or location/locations for single-location mode.',
+    };
+  }
+
+  if (locArray.length === 0) {
+    return { valid: false, error: 'At least one non-empty location is required.' };
+  }
+  if (locArray.length > 20) {
+    return { valid: false, error: 'Maximum 20 locations allowed in legacy mode.' };
+  }
+
+  return {
+    valid: true,
+    keyword: kw,
+    country: null,
+    states: [],
+    locations: locArray,
+    depth: depthValue as ScrapeDepth,
+    contactFilter: filterValue,
+    maxLeads: maxLeadsValue,
+    mode: 'legacy',
+  };
+}
+
+// â”€â”€â”€ Inter-job delay helper â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// â”€â”€â”€ Route Handler â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+startRouter.post('/', async (req: Request, res: Response): Promise<void> => {
+  // Reject if a job is already running
+  if (store.getStatus() === 'running') {
+    res.status(409).json({
+      error: 'job_already_running',
+      message: 'A job is already running. Stop it before starting a new one.',
+    });
+    return;
+  }
+
+  // Validate request body
+  const validation = validateStartBody(req.body as StartRequestBody);
+  if (!validation.valid) {
+    res.status(400).json({ error: 'invalid_request', message: validation.error });
+    return;
+  }
+
+  const { keyword, country, states, locations, depth, contactFilter, maxLeads, mode } = validation;
+
+  // Reset store â€” clears all previous session data
+  store.reset();
+  resetStopSignal();
+
+  logger.info(
+    `Job starting: keyword="${keyword}" mode=${mode} ` +
+    (mode === 'city_batched'
+      ? `country="${country}" states=${JSON.stringify(states)}`
+      : `locations=${JSON.stringify(locations)}`) +
+    ` depth="${depth}" contactFilter="${contactFilter}" maxLeads=${maxLeads}`
+  );
+
+  // â”€â”€ City-batched mode (Phase 14) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  if (mode === 'city_batched') {
+    // Resolve ISO code directly from country-state-city â€” no Nominatim needed
+    const isoCountryCode = resolveCountryIso(country!);
+    logger.info(`Country resolved: "${country}" â†’ ISO=${isoCountryCode}`);
+
+    // Initialise job context
+    const ctx = store.initJob(keyword, `${country}`, depth, isoCountryCode, contactFilter, maxLeads);
+    store.setStatus('running');
+    logger.info(`Job initialised (city_batched): jobId=${ctx.jobId}`);
+    res.status(202).json({ jobId: ctx.jobId });
+
+    // â”€â”€ Async city-batched controller â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // Owns: city pool building, batching, stop condition, inter-job delay.
+    // Auto-expansion: when initial CITIES_PER_STATE cities are exhausted,
+    // loads the next tier (ranked 21â€“40, 41â€“60, â€¦) from the same states
+    // until maxLeads is reached or all cities in those states are exhausted.
+    // pipeline.ts executes a single job only.
+    (async () => {
+      try {
+        const { getFullRankedCities } = await import('../pipeline/cityPool');
+        const { emitStatus, closeSSEConnection } = await import('../sse');
+
+        // Build the FULL ranked city list for each selected state (no cap).
+        // This is the complete ordered list we'll paginate through in tiers.
+        const fullCityList: import('../types').CityEntry[] = [];
+        for (const stateName of states) {
+          const stateCities = getFullRankedCities(isoCountryCode, stateName);
+          fullCityList.push(...stateCities);
+        }
+
+        if (fullCityList.length === 0) {
+          logger.warn(`City pool empty for country="${country}" states=${JSON.stringify(states)} â€” stopping`);
+          store.setStatus('completed');
+          const stats = store.getStats();
+          emitStatus(ctx.jobId, { status: 'completed', leadCount: stats.leadCount, discardCount: stats.discardCount });
+          closeSSEConnection(ctx.jobId);
+          return;
+        }
+
+        const totalCities = fullCityList.length;
+        const totalBatches = Math.ceil(totalCities / CITY_BATCH_SIZE);
+        logger.info(
+          `City pool ready: ${totalCities} total cities across ${states.length} state(s) ` +
+          `(${totalBatches} batches). Auto-expansion active â€” will use all cities if needed.`
+        );
+
+        let batchPointer = 0;
+        let citiesProcessed = 0;
+        let currentBatch = 0;
+
+        if (PARALLEL_CITIES_ENABLED) {
+          logger.info(
+            `Phase 5.1: parallel city execution enabled â€” max ${PARALLEL_CITIES_MAX} concurrent city jobs`
+          );
+        }
+
+        // â”€â”€ Batch loop â€” iterates through ALL cities in ranked order â”€â”€â”€â”€â”€â”€â”€â”€
+        // Phase 5.1: when PARALLEL_CITIES_ENABLED, cities within each batch
+        // run concurrently (up to PARALLEL_CITIES_MAX). Dedup is concurrency-safe.
+        // When disabled (default), cities run sequentially (original behaviour).
+        outer: while (batchPointer < totalCities) {
+          if (stopSignal.stopped) break;
+
+          const batch = fullCityList.slice(batchPointer, batchPointer + CITY_BATCH_SIZE);
+          batchPointer += CITY_BATCH_SIZE;
+          currentBatch++;
+
+          logger.info(
+            `Batch ${currentBatch}/${totalBatches}: [${batch.map((c) => c.name).join(', ')}]`
+          );
+
+          // Filter out visited cities before dispatching
+          const citiesToRun = batch.filter((city) => {
+            if (stopSignal.stopped) return false;
+            if (store.getLeadCount() >= maxLeads) return false;
+            if (isCityVisited(keyword, city.name, isoCountryCode)) {
+              logger.info(`VisitedCities: skipping "${city.name}, ${city.state}" â€” already scraped for "${keyword}" within window`);
+              citiesProcessed++;
+              return false;
+            }
+            return true;
+          });
+
+          if (citiesToRun.length === 0) continue;
+          if (stopSignal.stopped || store.getLeadCount() >= maxLeads) break outer;
+
+          if (PARALLEL_CITIES_ENABLED) {
+            // â”€â”€ Parallel execution: run up to PARALLEL_CITIES_MAX cities concurrently
+            for (let p = 0; p < citiesToRun.length; p += PARALLEL_CITIES_MAX) {
+              if (stopSignal.stopped || store.getLeadCount() >= maxLeads) break;
+
+              const parallelSlice = citiesToRun.slice(p, p + PARALLEL_CITIES_MAX);
+
+              const statsBeforeSlice = store.getStats();
+              emitStatus(ctx.jobId, {
+                status: 'running',
+                leadCount: statsBeforeSlice.leadCount,
+                discardCount: statsBeforeSlice.discardCount,
+                activeKeyword: keyword,
+                activeLocation: parallelSlice.map(c => c.name).join(', '),
+                batchProgress: { currentBatch, totalBatches, citiesProcessed, totalCities },
+              });
+
+              await Promise.allSettled(
+                parallelSlice.map(async (city) => {
+                  if (stopSignal.stopped || store.getLeadCount() >= maxLeads) return;
+                  const locationStr = `${city.name}, ${city.state}`;
+                  const iterCtx: JobContext = {
+                    jobId: ctx.jobId, keyword, location: locationStr,
+                    depth, isoCountryCode, contactFilter, maxLeads,
+                  };
+                  logger.info(`Parallel dispatch: "${locationStr}" (batch ${currentBatch}/${totalBatches})`);
+                  store.setStatus('running');
+                  await runPipeline(iterCtx, true);
+                  markCityVisited(keyword, city.name, isoCountryCode);
+                  citiesProcessed++;
+                })
+              );
+
+              if (INTER_JOB_DELAY_MS > 0 && !stopSignal.stopped && store.getLeadCount() < maxLeads) {
+                logger.info(`Inter-job delay: ${INTER_JOB_DELAY_MS}ms`);
+                await sleep(INTER_JOB_DELAY_MS);
+              }
+            }
+          } else {
+            // â”€â”€ Sequential execution (original behaviour) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            for (const city of citiesToRun) {
+              if (stopSignal.stopped) break outer;
+              if (store.getLeadCount() >= maxLeads) {
+                logger.info(`Stop condition: ${store.getLeadCount()} >= ${maxLeads} leads â€” halting`);
+                break outer;
+              }
+
+              const locationStr = `${city.name}, ${city.state}`;
+              const iterCtx: JobContext = {
+                jobId: ctx.jobId, keyword, location: locationStr,
+                depth, isoCountryCode, contactFilter, maxLeads,
+              };
+
+              if (!stopSignal.stopped) resetStopSignal();
+              store.setStatus('running');
+
+              const statsBeforeJob = store.getStats();
+              emitStatus(ctx.jobId, {
+                status: 'running',
+                leadCount: statsBeforeJob.leadCount,
+                discardCount: statsBeforeJob.discardCount,
+                activeKeyword: keyword,
+                activeLocation: locationStr,
+                batchProgress: { currentBatch, totalBatches, citiesProcessed, totalCities },
+              });
+
+              logger.info(
+                `Dispatching job: keyword="${keyword}" location="${locationStr}" ` +
+                `(batch ${currentBatch}/${totalBatches}, city ${citiesProcessed + 1}/${totalCities})`
+              );
+
+              await runPipeline(iterCtx, true);
+              markCityVisited(keyword, city.name, isoCountryCode);
+              citiesProcessed++;
+
+              if (INTER_JOB_DELAY_MS > 0 && !stopSignal.stopped && store.getLeadCount() < maxLeads) {
+                logger.info(`Inter-job delay: ${INTER_JOB_DELAY_MS}ms`);
+                await sleep(INTER_JOB_DELAY_MS);
+              }
+            }
+          }
+        }
+
+        // â”€â”€ Final status â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        const finalLeads = store.getLeadCount();
+        const wasStopped = stopSignal.stopped || store.getStatus() === 'stopped';
+        const finalStatus: 'completed' | 'stopped' = wasStopped ? 'stopped' : 'completed';
+
+        if (!wasStopped && finalLeads < maxLeads) {
+          logger.info(
+            `All cities exhausted (${citiesProcessed}/${totalCities}). ` +
+            `Collected ${finalLeads}/${maxLeads} leads. ` +
+            `To get more leads, add more states or change the keyword.`
+          );
+        } else if (!wasStopped) {
+          logger.info(`Target reached: ${finalLeads} leads collected.`);
+        }
+
+        store.setStatus(finalStatus);
+        const finalStats = store.getStats();
+        emitStatus(ctx.jobId, {
+          status: finalStatus,
+          leadCount: finalStats.leadCount,
+          discardCount: finalStats.discardCount,
+          batchProgress: {
+            currentBatch,
+            totalBatches,
+            citiesProcessed,
+            totalCities,
+          },
+        });
+        closeSSEConnection(ctx.jobId);
+      } catch (err) {
+        logger.error(`City-batched controller error: ${(err as Error).message}`);
+        store.setStatus('error');
+        const { emitStatus, closeSSEConnection } = await import('../sse');
+        const stats = store.getStats();
+        emitStatus(ctx.jobId, { status: 'error', leadCount: stats.leadCount, discardCount: stats.discardCount });
+        closeSSEConnection(ctx.jobId);
+      }
+    })();
+
+    return;
+  }
+
+  // â”€â”€ Legacy mode: plain location string(s) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // Backward compatible â€” single or multiple explicit location strings.
+  const geocodeResults = new Map<string, string>(); // location â†’ isoCountryCode
+  for (const loc of locations) {
+    try {
+      const geocodeResult = await geocodeLocation(loc);
+      geocodeResults.set(loc, geocodeResult.isoCountryCode);
+      logger.info(`Geocode success: "${loc}" â†’ ISO=${geocodeResult.isoCountryCode || '(unknown)'}`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Location could not be resolved';
+      logger.warn(`Geocode failed for "${loc}": ${message}`);
+      res.status(422).json({ error: 'invalid_location', message: `Location "${loc}": ${message}` });
+      return;
+    }
+  }
+
+  const ctx = store.initJob(
+    keyword,
+    locations[0],
+    depth,
+    geocodeResults.get(locations[0]) ?? '',
+    contactFilter,
+    maxLeads
+  );
+  store.setStatus('running');
+  logger.info(`Job initialised (legacy): jobId=${ctx.jobId}`);
+  res.status(202).json({ jobId: ctx.jobId });
+
+  // â”€â”€ Legacy multi-location pipeline (async, non-blocking) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  (async () => {
+    try {
+      for (let i = 0; i < locations.length; i++) {
+        if (store.getStatus() === 'stopped') break;
+        if (store.getLeadCount() >= maxLeads) break;
+
+        const loc = locations[i];
+        const isoCode = geocodeResults.get(loc) ?? '';
+        const iterCtx: JobContext = {
+          jobId: ctx.jobId,
+          keyword,
+          location: loc,
+          depth,
+          isoCountryCode: isoCode,
+          contactFilter,
+          maxLeads,
+        };
+
+        if (i > 0) {
+          store.setStatus('running');
+          resetStopSignal();
+        }
+
+        logger.info(`Legacy run ${i + 1}/${locations.length} â€” keyword="${keyword}" location="${loc}"`);
+
+        const isLastRun = i === locations.length - 1;
+        await runPipeline(iterCtx, !isLastRun);
+
+        if (INTER_JOB_DELAY_MS > 0 && !isLastRun && store.getStatus() !== 'stopped') {
+          await sleep(INTER_JOB_DELAY_MS);
+        }
+      }
+    } catch (err) {
+      logger.error(`Legacy pipeline error: ${(err as Error).message}`);
+      store.setStatus('error');
+    }
+  })();
+});
+
+
+===== src/pipeline/cityPool.ts =====
+
+/**
+ * pipeline/cityPool.ts
+ * Phase 12 â€” Location Engine (Revised): Static Global City Pool
+ *
+ * Data sources (both static, no network calls, no TTL):
+ *   1. country-state-city npm package â€” countries, states, ISO codes
+ *   2. GeoNames cities15000.txt       â€” city population for ranking
+ *   3. GeoNames admin1CodesASCII.txt  â€” maps GeoNames admin1 numeric codes
+ *                                       to state names (for population lookup)
+ *
+ * Architecture:
+ *   - Module-level Maps built once at startup from the two static sources.
+ *   - No Nominatim calls. No HTTP. No cache TTL. No bootstrap fallback.
+ *   - country-state-city provides the authoritative country/state/city list.
+ *   - GeoNames population is joined in to rank cities largest-first.
+ *   - Cities with no GeoNames population entry are ranked last (population = 0).
+ *
+ * Key functions:
+ *   getCountries()                    â€” all 250 countries with ISO codes
+ *   getStates(countryIso)             â€” states/regions for a country
+ *   buildCityPool(countryIso, state)  â€” ranked city pool for one state
+ *   buildMultiStateCityPool(iso, [])  â€” concatenated pools across states
+ *   resolveCountryIso(nameOrCode)     â€” full name â†’ ISO code
+ *
+ * CONSTRAINTS:
+ * - No pipeline.ts changes.
+ * - No new external dependencies beyond country-state-city (already installed).
+ * - CityEntry / CityPool types unchanged.
+ * - Batching compatibility preserved.
+ */
+
+import * as fs from 'fs';
+import * as path from 'path';
+import { Country, State, City } from 'country-state-city';
+import { logger } from '../logger';
+import { CityEntry, CityPool } from '../types';
+
+// â”€â”€â”€ Config â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+const CITIES_PER_STATE = parseInt(process.env.CITIES_PER_STATE ?? '20', 10);
+
+// â”€â”€â”€ Types â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+export interface StateEntry {
+  name: string;
+  isoCode: string;
+  countryCode: string;
+}
+
+export interface CountryEntry {
+  name: string;
+  isoCode: string;
+}
+
+// â”€â”€â”€ GeoNames Population Map â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+/**
+ * Maps `${countryIso}:${cityNameLower}` â†’ population.
+ * Built once at module load from cities15000.txt.
+ * Used to rank cities by population descending.
+ */
+const geoPopMap = new Map<string, number>();
+
+/**
+ * Maps `${countryIso}:${admin1NumericCode}` â†’ state name (lowercase).
+ * Built from admin1CodesASCII.txt.
+ * Used to join GeoNames admin1 numeric codes to state names.
+ */
+const admin1NameMap = new Map<string, string>();
+
+/**
+ * Phase 5 fix â€” Region bridge:
+ * Maps `${countryIso}:${admin1Code}` â†’ the country-state-city state isoCode
+ * that has cities and best matches the GeoNames admin1 region name.
+ *
+ * Built lazily per country on first use (not at startup) to avoid the
+ * ~20s startup cost of scanning all countries.
+ */
+const geoAdmin1ToRegionIso = new Map<string, string>();
+
+/** Tracks which countries have already had their bridge built. */
+const bridgeBuiltForCountry = new Set<string>();
+
+function loadGeoNamesData(): void {
+  const dataDir = path.join(__dirname, '..', '..', 'data');
+
+  // â”€â”€ Load admin1 codes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  const admin1Path = path.join(dataDir, 'admin1CodesASCII.txt');
+  if (fs.existsSync(admin1Path)) {
+    const lines = fs.readFileSync(admin1Path, 'utf8').split('\n').filter(Boolean);
+    for (const line of lines) {
+      const cols = line.split('\t');
+      if (cols.length < 2) continue;
+      // Format: "IN.28\tWest Bengal\t..."
+      const [countryDotAdmin, name] = [cols[0], cols[1]];
+      const dotIdx = countryDotAdmin.indexOf('.');
+      if (dotIdx === -1) continue;
+      const countryIso = countryDotAdmin.slice(0, dotIdx).toUpperCase();
+      const admin1Code = countryDotAdmin.slice(dotIdx + 1);
+      admin1NameMap.set(`${countryIso}:${admin1Code}`, name.toLowerCase().trim());
+    }
+    logger.info(`CityPool: loaded ${admin1NameMap.size} admin1 code mappings`);
+  } else {
+    logger.warn(`CityPool: admin1CodesASCII.txt not found at ${admin1Path} â€” population ranking disabled`);
+  }
+
+  // â”€â”€ Load cities15000 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  const citiesPath = path.join(dataDir, 'cities15000.txt');
+  if (fs.existsSync(citiesPath)) {
+    const lines = fs.readFileSync(citiesPath, 'utf8').split('\n').filter(Boolean);
+    let loaded = 0;
+    for (const line of lines) {
+      const cols = line.split('\t');
+      if (cols.length < 15) continue;
+      const cityName = cols[1]?.trim();
+      const countryIso = cols[8]?.trim().toUpperCase();
+      const admin1Code = cols[10]?.trim();
+      const population = parseInt(cols[14] ?? '0', 10);
+      if (!cityName || !countryIso || isNaN(population)) continue;
+
+      // Key by country + city name (lowercase) for direct lookup
+      const directKey = `${countryIso}:${cityName.toLowerCase()}`;
+      const existing = geoPopMap.get(directKey) ?? 0;
+      if (population > existing) {
+        geoPopMap.set(directKey, population);
+      }
+
+      // Also key by country + admin1 state name + city name for state-scoped lookup
+      const stateName = admin1NameMap.get(`${countryIso}:${admin1Code}`);
+      if (stateName) {
+        const stateKey = `${countryIso}:${stateName}:${cityName.toLowerCase()}`;
+        const existingState = geoPopMap.get(stateKey) ?? 0;
+        if (population > existingState) {
+          geoPopMap.set(stateKey, population);
+        }
+      }
+      loaded++;
+    }
+    logger.info(`CityPool: loaded ${loaded} GeoNames city population entries`);
+  } else {
+    logger.warn(`CityPool: cities15000.txt not found at ${citiesPath} â€” cities will not be ranked by population`);
+  }
+}
+
+// Load at module startup (synchronous, runs once)
+loadGeoNamesData();
+
+// â”€â”€â”€ Population Lookup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+/**
+ * Returns the population for a city, using state-scoped lookup first
+ * (more accurate for cities with duplicate names across states),
+ * then country-scoped fallback.
+ */
+function getCityPopulation(countryIso: string, stateName: string, cityName: string): number {
+  const iso = countryIso.toUpperCase();
+  const stateKey = `${iso}:${stateName.toLowerCase()}:${cityName.toLowerCase()}`;
+  const stateHit = geoPopMap.get(stateKey);
+  if (stateHit !== undefined) return stateHit;
+
+  const countryKey = `${iso}:${cityName.toLowerCase()}`;
+  return geoPopMap.get(countryKey) ?? 0;
+}
+
+// â”€â”€â”€ Country Name â†’ ISO Resolution â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+/** Module-level map: lowercase country name â†’ ISO code. Built once. */
+const countryNameToIso = new Map<string, string>();
+(function buildCountryNameMap() {
+  for (const c of Country.getAllCountries()) {
+    countryNameToIso.set(c.name.toLowerCase(), c.isoCode.toUpperCase());
+    countryNameToIso.set(c.isoCode.toLowerCase(), c.isoCode.toUpperCase());
+  }
+})();
+
+/**
+ * Resolves a country string (full name or ISO code) to an ISO 3166-1 alpha-2 code.
+ * Returns the input uppercased if no match found (pass-through for already-valid codes).
+ */
+export function resolveCountryIso(nameOrCode: string): string {
+  const lower = nameOrCode.trim().toLowerCase();
+  return countryNameToIso.get(lower) ?? nameOrCode.trim().toUpperCase();
+}
+
+// â”€â”€â”€ State Name Fuzzy Match â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+/**
+ * Finds the best matching state for a user-supplied state name.
+ * Tries exact match first, then case-insensitive, then prefix match.
+ * Returns the matched state or null.
+ */
+function findState(countryIso: string, stateName: string) {
+  const states = State.getStatesOfCountry(countryIso);
+  if (!states.length) return null;
+
+  const lower = stateName.trim().toLowerCase();
+
+  // Exact case-insensitive match
+  const exact = states.find((s) => s.name.toLowerCase() === lower);
+  if (exact) return exact;
+
+  // Prefix match (e.g. "uttrak" â†’ "Uttarakhand")
+  const prefix = states.find((s) => s.name.toLowerCase().startsWith(lower));
+  if (prefix) return prefix;
+
+  // Substring match (e.g. "tamil" â†’ "Tamil Nadu")
+  const sub = states.find(
+    (s) => s.name.toLowerCase().includes(lower) || lower.includes(s.name.toLowerCase())
+  );
+  if (sub) return sub;
+
+  // Fuzzy: input starts with first 5 chars of state name (handles typos like "uttrak" â†’ "uttarakhand")
+  if (lower.length >= 4) {
+    const fuzzy = states.find((s) => {
+      const sLower = s.name.toLowerCase().replace(/\s+/g, '');
+      const inputClean = lower.replace(/\s+/g, '');
+      // Check if first 5 chars of either match
+      return sLower.startsWith(inputClean.slice(0, 5)) || inputClean.startsWith(sLower.slice(0, 5));
+    });
+    if (fuzzy) return fuzzy;
+  }
+
+  return null;
+}
+
+// â”€â”€â”€ Region Bridge Helper â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+/**
+ * Lazily builds the GeoNames admin1 â†’ region bridge for a single country.
+ * Called on first use of that country â€” not at startup.
+ *
+ * Matches each GeoNames admin1 name to the country-state-city state with cities
+ * that has the most similar name. Stores results in geoAdmin1ToRegionIso.
+ */
+function buildBridgeForCountry(countryIso: string): void {
+  if (bridgeBuiltForCountry.has(countryIso)) return;
+  bridgeBuiltForCountry.add(countryIso);
+
+  const statesWithCities = State.getStatesOfCountry(countryIso).filter(
+    (s) => City.getCitiesOfState(countryIso, s.isoCode).length > 0
+  );
+  if (statesWithCities.length === 0) return;
+
+  // For each GeoNames admin1 entry for this country, find the best matching region
+  for (const [key, geoName] of admin1NameMap) {
+    if (!key.startsWith(`${countryIso}:`)) continue;
+    const admin1Code = key.slice(countryIso.length + 1);
+    const geoLower = geoName.replace(/[^a-z0-9]/g, '');
+
+    let bestIso: string | null = null;
+    let bestScore = 0;
+
+    for (const state of statesWithCities) {
+      const stateLower = state.name.toLowerCase().replace(/[^a-z0-9]/g, '');
+      let score = 0;
+
+      if (stateLower === geoLower) {
+        score = 100;
+      } else if (stateLower.includes(geoLower) || geoLower.includes(stateLower)) {
+        score = 60;
+      } else {
+        let shared = 0;
+        const minLen = Math.min(stateLower.length, geoLower.length);
+        for (let i = 0; i < minLen; i++) {
+          if (stateLower[i] === geoLower[i]) shared++;
+          else break;
+        }
+        if (shared >= 4) score = shared * 10;
+      }
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestIso = state.isoCode;
+      }
+    }
+
+    if (bestIso && bestScore >= 40) {
+      geoAdmin1ToRegionIso.set(`${countryIso}:${admin1Code}`, bestIso);
+    }
+  }
+}
+
+/**
+ * When a matched state has 0 cities, finds the parent region that has cities.
+ *
+ * Strategy (in order):
+ * 1. GeoNames bridge: match the state name to a GeoNames admin1 entry, then
+ *    look up the bridge to find the correct region-with-cities.
+ * 2. Name similarity: find the state-with-cities whose name most closely matches.
+ * 3. City-name fallback: if the input looks like a city name, find the region
+ *    that contains a city with that name.
+ *
+ * Returns the isoCode of the best matching region-with-cities, or null.
+ */
+function findRegionWithCities(countryIso: string, matchedStateName: string, originalInput: string): string | null {
+  // Ensure bridge is built for this country (lazy, cached)
+  buildBridgeForCountry(countryIso);
+
+  const statesWithCities = State.getStatesOfCountry(countryIso).filter(
+    (s) => City.getCitiesOfState(countryIso, s.isoCode).length > 0
+  );
+  if (statesWithCities.length === 0) return null;
+
+  // Strategy 1: GeoNames bridge â€” find admin1 code for the matched state name
+  const matchedLower = matchedStateName.toLowerCase().replace(/[^a-z0-9]/g, '');
+  for (const [key, geoName] of admin1NameMap) {
+    if (!key.startsWith(`${countryIso}:`)) continue;
+    const geoNorm = geoName.replace(/[^a-z0-9]/g, '');
+    if (
+      geoNorm === matchedLower ||
+      (matchedLower.length >= 5 && geoNorm.startsWith(matchedLower.slice(0, 5))) ||
+      (geoNorm.length >= 5 && matchedLower.startsWith(geoNorm.slice(0, 5)))
+    ) {
+      const admin1Code = key.slice(countryIso.length + 1);
+      const bridgedIso = geoAdmin1ToRegionIso.get(`${countryIso}:${admin1Code}`);
+      if (bridgedIso) return bridgedIso;
+    }
+  }
+
+  // Strategy 2: name similarity against states-with-cities
+  const inputLower = originalInput.toLowerCase().replace(/[^a-z0-9]/g, '');
+  let bestIso: string | null = null;
+  let bestScore = 0;
+
+  for (const state of statesWithCities) {
+    const stateLower = state.name.toLowerCase().replace(/[^a-z0-9]/g, '');
+    let score = 0;
+
+    if (stateLower === inputLower || stateLower === matchedLower) {
+      score = 100;
+    } else {
+      // Only apply substring/prefix checks when lengths are reasonably similar
+      // (ratio >= 0.5) to avoid "barcelona".includes("lon") matching LÃ©on
+      const longer = Math.max(stateLower.length, inputLower.length);
+      const shorter = Math.min(stateLower.length, inputLower.length);
+      const lengthRatio = shorter / longer;
+
+      if (lengthRatio >= 0.5) {
+        if (stateLower.includes(inputLower) || inputLower.includes(stateLower)) {
+          score = 60;
+        } else if (stateLower.includes(matchedLower) || matchedLower.includes(stateLower)) {
+          score = 55;
+        }
+      }
+
+      if (score === 0) {
+        // Shared prefix (length-independent)
+        let shared = 0;
+        const minLen = Math.min(stateLower.length, inputLower.length);
+        for (let i = 0; i < minLen; i++) {
+          if (stateLower[i] === inputLower[i]) shared++;
+          else break;
+        }
+        if (shared >= 4) score = shared * 8;
+      }
+    }
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestIso = state.isoCode;
+    }
+  }
+
+  if (bestScore >= 40 && bestIso) return bestIso;
+
+  // Strategy 3: city-name fallback â€” input may be a city name.
+  // Pick the region containing the highest-population city with that name
+  // to avoid matching small towns before major cities.
+  const cityInputLower = originalInput.toLowerCase();
+  let bestCityRegionIso: string | null = null;
+  let bestCityPop = -1;
+
+  for (const state of statesWithCities) {
+    const cities = City.getCitiesOfState(countryIso, state.isoCode);
+    const match = cities.find(
+      (c) => c.name.toLowerCase() === cityInputLower || c.name.toLowerCase().startsWith(cityInputLower)
+    );
+    if (match) {
+      const pop = geoPopMap.get(`${countryIso}:${match.name.toLowerCase()}`) ?? 0;
+      if (pop > bestCityPop) {
+        bestCityPop = pop;
+        bestCityRegionIso = state.isoCode;
+      }
+    }
+  }
+
+  if (bestCityRegionIso) return bestCityRegionIso;
+
+  return null;
+}
+
+// â”€â”€â”€ Public API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+/** Returns all 250 countries with name and ISO code. */
+export function getCountries(): CountryEntry[] {
+  return Country.getAllCountries().map((c) => ({
+    name: c.name,
+    isoCode: c.isoCode,
+  }));
+}
+
+/**
+ * Returns all states/regions for a country.
+ * Only returns states that have cities in the package â€” filters out
+ * sub-regions/departments that have 0 cities to prevent empty city pools.
+ * @param countryIso  ISO 3166-1 alpha-2 code or full country name
+ */
+export function getStates(countryIso: string): StateEntry[] {
+  const iso = resolveCountryIso(countryIso);
+  const allStates = State.getStatesOfCountry(iso);
+
+  // Filter to states that actually have cities â€” avoids showing departments
+  // that are listed in the package but have no city data (e.g. FR departments
+  // vs FR regions, IT provinces vs IT regions, GB counties vs GB nations).
+  const statesWithCities = allStates.filter(
+    (s) => City.getCitiesOfState(iso, s.isoCode).length > 0
+  );
+
+  // If filtering leaves nothing (e.g. very small country), return all states
+  const result = statesWithCities.length > 0 ? statesWithCities : allStates;
+
+  return result.map((s) => ({
+    name: s.name,
+    isoCode: s.isoCode,
+    countryCode: s.countryCode,
+  }));
+}
+
+/**
+ * Builds a city pool for a given country + state/region.
+ *
+ * Cities come from country-state-city package (authoritative list).
+ * Population from GeoNames is used to rank cities largest-first.
+ * Cities with no GeoNames entry are appended at the end (population = 0).
+ * Pool is capped at CITIES_PER_STATE (default 20).
+ *
+ * @param countryIso  ISO 3166-1 alpha-2 code or full country name
+ * @param stateName   State/region name (fuzzy matched)
+ */
+export async function buildCityPool(countryIso: string, stateName: string): Promise<CityPool> {
+  const iso = resolveCountryIso(countryIso);
+
+  // Fuzzy-match the state name to handle typos / partial names
+  const matchedState = findState(iso, stateName);
+  if (!matchedState) {
+    logger.warn(`CityPool: no state match for "${stateName}" in country="${iso}" â€” returning empty pool`);
+    return { state: stateName, cities: [], fetchedAt: Date.now() };
+  }
+
+  const resolvedStateName = matchedState.name;
+  const stateIsoCode = matchedState.isoCode;
+
+  logger.info(
+    `CityPool: building pool â€” country="${iso}" state="${resolvedStateName}" (matched from "${stateName}") target=${CITIES_PER_STATE}`
+  );
+
+  // Get cities from country-state-city
+  const rawCities = City.getCitiesOfState(iso, stateIsoCode);
+
+  if (rawCities.length === 0) {
+    logger.warn(`CityPool: no cities found for country="${iso}" state="${resolvedStateName}"`);
+    return { state: resolvedStateName, cities: [], fetchedAt: Date.now() };
+  }
+
+  // Attach population from GeoNames and sort descending
+  const ranked = rawCities
+    .map((c) => ({
+      name: c.name,
+      population: getCityPopulation(iso, resolvedStateName, c.name),
+      lat: c.latitude ? parseFloat(c.latitude) : undefined,
+      lon: c.longitude ? parseFloat(c.longitude) : undefined,
+    }))
+    .sort((a, b) => b.population - a.population);
+
+  const cities: CityEntry[] = ranked.slice(0, CITIES_PER_STATE).map((c) => ({
+    name: c.name,
+    state: resolvedStateName,
+    country: iso,
+    lat: c.lat,
+    lon: c.lon,
+    importance: c.population > 0 ? c.population / 10_000_000 : undefined,
+    source: 'static' as const,
+  }));
+
+  logger.info(
+    `CityPool: pool ready â€” country="${iso}" state="${resolvedStateName}" â€” ${cities.length} cities (top: ${cities[0]?.name ?? 'none'})`
+  );
+
+  return { state: resolvedStateName, cities, fetchedAt: Date.now() };
+}
+
+/**
+ * Returns the FULL ranked city list for a state (no cap).
+ * Used by the auto-expansion controller to paginate through city tiers.
+ *
+ * @param countryIso  ISO 3166-1 alpha-2 code
+ * @param stateName   State/region name (fuzzy matched)
+ * @returns All cities sorted by population descending, or [] if state not found
+ */
+export function getFullRankedCities(countryIso: string, stateName: string): CityEntry[] {
+  const iso = resolveCountryIso(countryIso);
+  let matchedState = findState(iso, stateName);
+
+  if (!matchedState) {
+    // findState found nothing â€” try the region bridge directly with the raw input.
+    // Handles city names (e.g. "Barcelona" â†’ Catalonia) and alternate spellings.
+    const bridgedIso = findRegionWithCities(iso, stateName, stateName);
+    if (bridgedIso) {
+      const bridgedState = State.getStatesOfCountry(iso).find(s => s.isoCode === bridgedIso);
+      if (bridgedState) {
+        logger.info(
+          `CityPool: "${stateName}" not found as state â€” resolved to region "${bridgedState.name}" (${iso})`
+        );
+        matchedState = bridgedState;
+      }
+    }
+    if (!matchedState) return [];
+  }
+
+  // â”€â”€ Region bridge: if matched state has 0 cities, find the parent region â”€â”€
+  // This handles countries where city data is stored under top-level regions
+  // but the package also lists sub-regions/departments as states (e.g. France,
+  // Italy, Spain, UK). We use the GeoNames admin1 bridge built at startup to
+  // find the correct region.
+  if (City.getCitiesOfState(iso, matchedState.isoCode).length === 0) {
+    const bridgedIso = findRegionWithCities(iso, matchedState.name, stateName);
+    if (bridgedIso) {
+      const bridgedState = State.getStatesOfCountry(iso).find(s => s.isoCode === bridgedIso);
+      if (bridgedState) {
+        logger.info(
+          `CityPool: "${stateName}" (${matchedState.name}) has no cities â€” ` +
+          `resolved to parent region "${bridgedState.name}" (${iso})`
+        );
+        matchedState = bridgedState;
+      }
+    }
+  }
+
+  const resolvedStateName = matchedState.name;
+  const stateIsoCode = matchedState.isoCode;
+  const rawCities = City.getCitiesOfState(iso, stateIsoCode);
+  if (rawCities.length === 0) return [];
+
+  return rawCities
+    .map((c) => ({
+      name: c.name,
+      population: getCityPopulation(iso, resolvedStateName, c.name),
+      lat: c.latitude ? parseFloat(c.latitude) : undefined,
+      lon: c.longitude ? parseFloat(c.longitude) : undefined,
+    }))
+    .sort((a, b) => b.population - a.population)
+    .map((c) => ({
+      name: c.name,
+      state: resolvedStateName,
+      country: iso,
+      lat: c.lat,
+      lon: c.lon,
+      importance: c.population > 0 ? c.population / 10_000_000 : undefined,
+      source: 'static' as const,
+    }));
+}
+
+/**
+ * Builds city pools for multiple states within a country and concatenates them.
+ * States are processed in input order; within each state, largest cities first.
+ *
+ * @param countryIso  ISO 3166-1 alpha-2 code or full country name
+ * @param stateNames  Array of state/region names (fuzzy matched)
+ */
+export async function buildMultiStateCityPool(
+  countryIso: string,
+  stateNames: string[]
+): Promise<CityEntry[]> {
+  const iso = resolveCountryIso(countryIso);
+  const allCities: CityEntry[] = [];
+
+  for (const stateName of stateNames) {
+    const pool = await buildCityPool(iso, stateName);
+    allCities.push(...pool.cities);
+  }
+
+  logger.info(
+    `CityPool: multi-state pool â€” country="${iso}" ${stateNames.length} state(s), ${allCities.length} total cities`
+  );
+  return allCities;
+}
+
+
+===== src/types.ts =====
+
+/**
+ * types.ts
+ * Central type definitions for the Lead Generation Scraper.
+ * These types are the single source of truth for all data shapes.
+ *
+ * CONSTRAINTS:
+ * - _hasBoth and _qualityTier are INTERNAL ONLY â€” never exported to Excel or SSE payloads
+ * - phone must always be E.164 format or empty string
+ * - email must always be scraped â€” never guessed or generated
+ */
+
+// â”€â”€â”€ Quality Tier â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+/** Internal classification of lead contact completeness. Never exported. */
+export type QualityTier = 'Tier1' | 'Tier2' | 'Tier3';
+
+// â”€â”€â”€ Job Status â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+/** Lifecycle states of a scrape job. */
+export type JobStatus = 'idle' | 'running' | 'stopped' | 'completed' | 'error';
+
+// â”€â”€â”€ Scrape Depth â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+/** Controls how deep website scraping goes per business. */
+export type ScrapeDepth = 'homepage' | 'indepth';
+
+// â”€â”€â”€ Contact Filter â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+/**
+ * Controls which leads are kept after scraping.
+ *
+ * any        â€” keep if email OR phone present (default, original behaviour)
+ * email_only â€” keep only if email is present (phone optional)
+ * phone_only â€” keep only if phone is present (email optional)
+ * both       â€” keep only if BOTH email AND phone are present
+ */
+export type ContactFilter = 'any' | 'email_only' | 'phone_only' | 'both';
+
+// â”€â”€â”€ Lead â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+/**
+ * A qualifying business record with at least one contact method.
+ * Internal fields (_hasBoth, _qualityTier) must never appear in exports or SSE payloads.
+ */
+export interface Lead {
+  /** Business name â€” always present, sourced from discovery. */
+  businessName: string;
+
+  /** Scraped email address. Empty string if not found. NEVER guessed. */
+  email: string;
+
+  /** Phone in E.164 format (e.g. +919876543210). Empty string if not found. */
+  phone: string;
+
+  /** Full website URL with https://. Empty string if not found. */
+  website: string;
+
+  /** Formatted address â€” always present, sourced from discovery. */
+  address: string;
+
+  /** Internal sort key: true if both email AND phone are present. NOT exported. */
+  _hasBoth: boolean;
+
+  /** Internal quality classification. NOT exported. NOT in SSE payloads. */
+  _qualityTier: QualityTier;
+
+  /**
+   * True if a contact form was detected on the website but no email was scraped.
+   * Informational only â€” never used for filtering. NOT a constraint violation.
+   */
+  hasContactForm?: boolean;
+
+  /**
+   * True if the email is a generic role address (info@, contact@, support@, etc.).
+   * Flagged for outreach teams â€” lower reply rate than personal addresses.
+   */
+  isGenericEmail?: boolean;
+
+  /**
+   * True if the email is from a freemail provider (gmail.com, yahoo.com, etc.).
+   * Kept only when no company-domain email exists.
+   */
+  isFreeEmail?: boolean;
+
+  /**
+   * True if the email is from a relay/platform domain or uses a "+" alias
+   * on a non-business, non-freemail domain.
+   * Indicates higher bounce risk.
+   */
+  isRelayEmail?: boolean;
+}
+
+/**
+ * Public-facing lead fields safe to include in SSE `lead` events.
+ * Strips all internal fields.
+ */
+export type PublicLead = Omit<Lead, '_hasBoth' | '_qualityTier'>;
+
+// â”€â”€â”€ Raw Lead â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+/**
+ * A business record returned by the Discovery_Module before filtering.
+ * May have no phone and no website URL â€” kept regardless (constraint: filter runs post-scrape only).
+ */
+export interface RawLead {
+  /** Business name from discovery source. */
+  name: string;
+
+  /** Formatted address from discovery source. */
+  address: string;
+
+  /** Raw phone string from discovery source. May be empty. Not yet normalised. */
+  rawPhone: string;
+
+  /** Website URL from discovery source. May be empty. */
+  website: string;
+
+  /** Place ID from Outscraper (for debug/logging). May be empty for Maps fallback. */
+  placeId: string;
+}
+
+// â”€â”€â”€ Failure Metrics â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+/**
+ * Counters for pipeline failure conditions.
+ * Exposed via GET /api/status. Reset on store.reset().
+ */
+export interface FailureMetrics {
+  /** Leads discarded because both email and phone were empty after all scraping. */
+  discard_no_contact: number;
+
+  /** Business websites that returned 4xx/5xx, timed out, or redirected to login. */
+  website_unreachable: number;
+
+  /** Leads where no email survived extraction and filtering. */
+  email_not_found: number;
+
+  /** Leads where no valid phone number was found or normalised. */
+  phone_not_found: number;
+
+  /** Raw leads skipped by the Deduplicator (key already seen in this run). */
+  duplicate_skipped: number;
+
+  /** Website scraping requests blocked by CAPTCHA. */
+  captcha_blocked: number;
+
+  /** Sub-pages successfully scraped during in-depth crawl (depth=indepth). */
+  subpages_scraped: number;
+
+  /** Phase 1: Serper API metrics */
+  serper_queries: number;
+  serper_failures: number;
+  serper_fallbacks: number;
+  serper_results_used: number;
+}
+
+// â”€â”€â”€ Job Context â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+/**
+ * Runtime context for a single scrape job.
+ * Created on POST /api/start, cleared on store.reset().
+ */
+export interface JobContext {
+  /** Unique job identifier (UUID v4). */
+  jobId: string;
+
+  /** Search keyword â€” exactly 1 per run (e.g. "plumber"). */
+  keyword: string;
+
+  /** Location string used for the current city query (e.g. "Houston, TX"). */
+  location: string;
+
+  /** Scraping depth setting. */
+  depth: ScrapeDepth;
+
+  /**
+   * ISO 3166-1 alpha-2 country code extracted from the Geocoder response.
+   * Used as defaultRegion for libphonenumber-js throughout the run.
+   * e.g. "IN", "US", "GB"
+   */
+  isoCountryCode: string;
+
+  /**
+   * Contact filter mode chosen by the operator.
+   * Determines which leads pass the post-scrape filter.
+   * Defaults to 'any' (original behaviour â€” email OR phone).
+   */
+  contactFilter: ContactFilter;
+
+  /**
+   * Maximum number of leads to collect before stopping.
+   * The job queue / controller stops dispatching new city jobs once this is reached.
+   * Defaults to MAX_LEADS env var (fallback: 100).
+   */
+  maxLeads: number;
+}
+
+// â”€â”€â”€ City Pool (Phase 12 â€” Location Engine) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+/**
+ * A single city entry in the city pool.
+ * Sourced from the static base or fetched from Nominatim (fallback).
+ */
+export interface CityEntry {
+  /** City name (e.g. "Houston", "Mumbai"). */
+  name: string;
+  /** State/region name (e.g. "Texas", "Maharashtra"). */
+  state: string;
+  /** ISO 3166-1 alpha-2 country code (e.g. "US", "IN"). Populated for all entries. */
+  country?: string;
+  /** Latitude â€” populated for Nominatim-sourced entries. */
+  lat?: number;
+  /** Longitude â€” populated for Nominatim-sourced entries. */
+  lon?: number;
+  /** Nominatim importance score (0â€“1). Higher = more significant city. */
+  importance?: number;
+  /** Where this entry came from. */
+  source: 'static' | 'nominatim';
+}
+
+/**
+ * A resolved city pool for one state.
+ * Built once per state at session start; cities sorted by population descending.
+ */
+export interface CityPool {
+  /** US state abbreviation (e.g. "TX"). */
+  state: string;
+  /** Ordered list of cities â€” largest first. */
+  cities: CityEntry[];
+  /** Unix timestamp (ms) when this pool was built. */
+  fetchedAt: number;
+}
+
+// â”€â”€â”€ Store Stats â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+/** Snapshot of current job statistics. Returned by GET /api/status. */
+export interface StoreStats {
+  leadCount: number;
+  discardCount: number;
+  jobStatus: JobStatus;
+  failureMetrics: FailureMetrics;
+  jobContext: JobContext | null;
+}
+
+// â”€â”€â”€ SSE Event Payloads â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+/** Payload for SSE `lead` events. Public fields only â€” no internal fields. */
+export interface SseLeadPayload extends PublicLead {}
+
+/** Payload for SSE `discard` events. */
+export interface SseDiscardPayload {
+  total: number;
+  leadCount: number;
+  jobStatus: JobStatus;
+}
+
+/** Payload for SSE `status` events. */
+export interface SseStatusPayload {
+  status: JobStatus;
+  leadCount: number;
+  discardCount: number;
+  /** Active keyword for the current pipeline run. Omitted on final/terminal events. */
+  activeKeyword?: string;
+  /** Active location for the current pipeline run. Omitted on final/terminal events. */
+  activeLocation?: string;
+  /** Phase 14 â€” City batching progress. Present only during city-batched runs. */
+  batchProgress?: {
+    /** Current batch number (1-based). */
+    currentBatch: number;
+    /** Total number of batches. */
+    totalBatches: number;
+    /** Number of cities processed so far. */
+    citiesProcessed: number;
+    /** Total cities in the pool. */
+    totalCities: number;
+  };
+}
+
+/** Payload for SSE `error` events. */
+export interface SseErrorPayload {
+  message: string;
+}
+
+/** Union of all SSE event types. */
+export type SseEventType = 'lead' | 'discard' | 'status' | 'error';
+
+export interface SseEvent {
+  event: SseEventType;
+  data: SseLeadPayload | SseDiscardPayload | SseStatusPayload | SseErrorPayload;
+}
+
+
+===== src/components/InputPanel.tsx =====
+
+'use client';
+
+import { useState, useEffect, useRef, KeyboardEvent } from 'react';
+import { ContactFilter, ScrapeDepth, PROFESSION_LABELS } from '../types';
+
+const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? '';
+
+interface CountryOption { name: string; isoCode: string; }
+interface StateOption   { name: string; isoCode: string; }
+
+// â”€â”€â”€ Props â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+interface InputPanelProps {
+  profession: string;
+  country: string;          // ISO code (e.g. "IN")
+  countryName: string;      // display name (e.g. "India")
+  states: string[];         // selected state names
+  maxLeads: number;
+  depth: ScrapeDepth;
+  contactFilter: ContactFilter;
+  locationError: string;
+  isRunning: boolean;
+  onProfessionChange: (v: string) => void;
+  onCountryChange: (isoCode: string, name: string) => void;
+  onStatesChange: (states: string[]) => void;
+  onMaxLeadsChange: (n: number) => void;
+  onDepthChange: (v: ScrapeDepth) => void;
+  onContactFilterChange: (v: ContactFilter) => void;
+  onStart: () => void;
+  onStop: () => void;
+}
+
+export default function InputPanel({
+  profession,
+  country,
+  countryName,
+  states,
+  maxLeads,
+  depth,
+  contactFilter,
+  locationError,
+  isRunning,
+  onProfessionChange,
+  onCountryChange,
+  onStatesChange,
+  onMaxLeadsChange,
+  onDepthChange,
+  onContactFilterChange,
+  onStart,
+  onStop,
+}: InputPanelProps) {
+  // â”€â”€ Country data â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  const [countries, setCountries] = useState<CountryOption[]>([]);
+  const [countriesLoading, setCountriesLoading] = useState(false);
+
+  // â”€â”€ State data â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  const [availableStates, setAvailableStates] = useState<StateOption[]>([]);
+  const [statesLoading, setStatesLoading] = useState(false);
+
+  // â”€â”€ State dropdown open/close â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  const [stateDropdownOpen, setStateDropdownOpen] = useState(false);
+  const [stateSearch, setStateSearch] = useState('');
+  const stateDropdownRef = useRef<HTMLDivElement>(null);
+
+  // â”€â”€ Load countries on mount â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  useEffect(() => {
+    setCountriesLoading(true);
+    fetch(`${API_BASE}/api/locations/countries`)
+      .then((r) => r.json())
+      .then((data: CountryOption[]) => setCountries(data))
+      .catch(() => {/* silently fail â€” user can still type */})
+      .finally(() => setCountriesLoading(false));
+  }, []);
+
+  // â”€â”€ Load states when country changes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  useEffect(() => {
+    if (!country) {
+      setAvailableStates([]);
+      onStatesChange([]);
+      return;
+    }
+    setStatesLoading(true);
+    setAvailableStates([]);
+    onStatesChange([]);
+    fetch(`${API_BASE}/api/locations/states?country=${encodeURIComponent(country)}`)
+      .then((r) => r.json())
+      .then((data: StateOption[]) => setAvailableStates(data))
+      .catch(() => {})
+      .finally(() => setStatesLoading(false));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [country]);
+
+  // â”€â”€ Close state dropdown on outside click â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  useEffect(() => {
+    function handleClick(e: MouseEvent) {
+      if (stateDropdownRef.current && !stateDropdownRef.current.contains(e.target as Node)) {
+        setStateDropdownOpen(false);
+      }
+    }
+    document.addEventListener('mousedown', handleClick);
+    return () => document.removeEventListener('mousedown', handleClick);
+  }, []);
+
+  // â”€â”€ State toggle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  function toggleState(name: string) {
+    if (states.includes(name)) {
+      onStatesChange(states.filter((s) => s !== name));
+    } else {
+      onStatesChange([...states, name]);
+    }
+  }
+
+  function selectAllStates() {
+    onStatesChange(availableStates.map((s) => s.name));
+  }
+
+  function clearAllStates() {
+    onStatesChange([]);
+  }
+
+  // â”€â”€ Filtered states for search â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  const filteredStates = availableStates.filter((s) =>
+    s.name.toLowerCase().includes(stateSearch.toLowerCase())
+  );
+
+  const canStart = profession.trim().length > 0 && country.length > 0 && states.length > 0;
+
+  return (
+    <div className="bg-white border border-gray-200 rounded-lg p-5 space-y-4">
+
+      {/* â”€â”€ Keyword / Profession â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
+      <div>
+        <label htmlFor="profession" className="block text-sm font-medium text-gray-700 mb-1">
+          Keyword / Profession
+        </label>
+        <datalist id="profession-suggestions">
+          {PROFESSION_LABELS.map((label) => (
+            <option key={label} value={label} />
+          ))}
+        </datalist>
+        <input
+          id="profession"
+          type="text"
+          list="profession-suggestions"
+          value={profession}
+          onChange={(e) => onProfessionChange(e.target.value)}
+          placeholder="e.g. plumber, dentist, real estate agent"
+          disabled={isRunning}
+          autoComplete="off"
+          className="w-full border border-gray-300 rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100 disabled:cursor-not-allowed"
+          aria-label="Keyword or profession"
+        />
+        <p className="mt-1 text-xs text-gray-400">
+          Type any keyword or pick a suggestion. 1 keyword per run â€” cities expand automatically.
+        </p>
+      </div>
+
+      {/* â”€â”€ Country dropdown â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
+      <div>
+        <label htmlFor="country-select" className="block text-sm font-medium text-gray-700 mb-1">
+          Country
+        </label>
+        <select
+          id="country-select"
+          value={country}
+          onChange={(e) => {
+            const selected = countries.find((c) => c.isoCode === e.target.value);
+            onCountryChange(e.target.value, selected?.name ?? '');
+          }}
+          disabled={isRunning || countriesLoading}
+          className="w-full border border-gray-300 rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100 disabled:cursor-not-allowed"
+          aria-label="Select country"
+        >
+          <option value="">
+            {countriesLoading ? 'Loading countriesâ€¦' : 'â€” Select a country â€”'}
+          </option>
+          {countries.map((c) => (
+            <option key={c.isoCode} value={c.isoCode}>
+              {c.name}
+            </option>
+          ))}
+        </select>
+      </div>
+
+      {/* â”€â”€ States multi-select dropdown â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
+      <div>
+        <label className="block text-sm font-medium text-gray-700 mb-1">
+          States / Regions
+          <span className="ml-1 text-xs text-gray-400 font-normal">
+            ({states.length} selected{availableStates.length > 0 ? ` of ${availableStates.length}` : ''})
+          </span>
+        </label>
+
+        {/* Selected state chips */}
+        {states.length > 0 && (
+          <div className="flex flex-wrap gap-1.5 mb-2" aria-label="Selected states">
+            {states.map((s) => (
+              <span
+                key={s}
+                className={`inline-flex items-center gap-1 px-2 py-0.5 text-xs rounded-full ${
+                  locationError ? 'bg-red-100 text-red-800' : 'bg-green-100 text-green-800'
+                }`}
+              >
+                {s}
+                {!isRunning && (
+                  <button
+                    type="button"
+                    onClick={() => toggleState(s)}
+                    className="ml-0.5 hover:opacity-70 focus:outline-none"
+                    aria-label={`Remove ${s}`}
+                  >
+                    Ã—
+                  </button>
+                )}
+              </span>
+            ))}
+          </div>
+        )}
+
+        {/* Dropdown trigger */}
+        <div className="relative" ref={stateDropdownRef}>
+          <button
+            type="button"
+            onClick={() => !isRunning && country && setStateDropdownOpen((o) => !o)}
+            disabled={isRunning || !country || statesLoading}
+            className="w-full flex items-center justify-between border border-gray-300 rounded px-3 py-2 text-sm text-left bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100 disabled:cursor-not-allowed"
+            aria-haspopup="listbox"
+            aria-expanded={stateDropdownOpen}
+          >
+            <span className="text-gray-500">
+              {statesLoading
+                ? 'Loading statesâ€¦'
+                : !country
+                ? 'Select a country first'
+                : states.length === 0
+                ? 'Select states / regionsâ€¦'
+                : `${states.length} state${states.length !== 1 ? 's' : ''} selected`}
+            </span>
+            <span className="text-gray-400 ml-2">{stateDropdownOpen ? 'â–²' : 'â–¼'}</span>
+          </button>
+
+          {/* Dropdown panel */}
+          {stateDropdownOpen && availableStates.length > 0 && (
+            <div className="absolute z-20 mt-1 w-full bg-white border border-gray-200 rounded-lg shadow-lg">
+              {/* Search + bulk actions */}
+              <div className="p-2 border-b border-gray-100 space-y-1.5">
+                <input
+                  type="text"
+                  value={stateSearch}
+                  onChange={(e) => setStateSearch(e.target.value)}
+                  placeholder="Search statesâ€¦"
+                  className="w-full border border-gray-200 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-blue-400"
+                  aria-label="Search states"
+                  autoFocus
+                />
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={selectAllStates}
+                    className="text-xs text-blue-600 hover:underline"
+                  >
+                    Select all
+                  </button>
+                  <span className="text-gray-300">|</span>
+                  <button
+                    type="button"
+                    onClick={clearAllStates}
+                    className="text-xs text-gray-500 hover:underline"
+                  >
+                    Clear
+                  </button>
+                </div>
+              </div>
+
+              {/* State list */}
+              <ul
+                className="max-h-52 overflow-y-auto py-1"
+                role="listbox"
+                aria-multiselectable="true"
+                aria-label="States"
+              >
+                {filteredStates.length === 0 ? (
+                  <li className="px-3 py-2 text-xs text-gray-400">No states match</li>
+                ) : (
+                  filteredStates.map((s) => {
+                    const checked = states.includes(s.name);
+                    return (
+                      <li
+                        key={s.isoCode}
+                        role="option"
+                        aria-selected={checked}
+                        onClick={() => toggleState(s.name)}
+                        className={`flex items-center gap-2 px-3 py-1.5 text-sm cursor-pointer hover:bg-blue-50 ${
+                          checked ? 'bg-blue-50 text-blue-800' : 'text-gray-700'
+                        }`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() => toggleState(s.name)}
+                          className="accent-blue-600 pointer-events-none"
+                          aria-hidden="true"
+                          tabIndex={-1}
+                        />
+                        {s.name}
+                      </li>
+                    );
+                  })
+                )}
+              </ul>
+
+              {/* Close button */}
+              <div className="p-2 border-t border-gray-100 text-right">
+                <button
+                  type="button"
+                  onClick={() => setStateDropdownOpen(false)}
+                  className="text-xs text-gray-500 hover:text-gray-700"
+                >
+                  Done
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {locationError && (
+          <p id="location-error" role="alert" className="mt-1 text-xs text-red-600">
+            {locationError}
+          </p>
+        )}
+        <p className="mt-1 text-xs text-gray-400">
+          Cities are fetched automatically per state. All cities are tried before giving up.
+        </p>
+      </div>
+
+      {/* â”€â”€ Max Leads â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
+      <div>
+        <label htmlFor="maxLeads" className="block text-sm font-medium text-gray-700 mb-1">
+          Max Leads
+        </label>
+        <input
+          id="maxLeads"
+          type="number"
+          min={1}
+          max={10000}
+          value={maxLeads}
+          onChange={(e) => {
+            const v = parseInt(e.target.value, 10);
+            if (!isNaN(v) && v > 0) onMaxLeadsChange(v);
+          }}
+          disabled={isRunning}
+          className="w-40 border border-gray-300 rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100 disabled:cursor-not-allowed"
+          aria-label="Maximum leads to collect"
+        />
+        <p className="mt-1 text-xs text-gray-400">
+          Scraping stops automatically when this target is reached.
+        </p>
+      </div>
+
+      {/* â”€â”€ Depth toggle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
+      <div>
+        <span className="block text-sm font-medium text-gray-700 mb-2">Depth</span>
+        <div className="flex gap-4" role="radiogroup" aria-label="Scraping depth">
+          {(['homepage', 'indepth'] as ScrapeDepth[]).map((d) => (
+            <label key={d} className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="radio"
+                name="depth"
+                value={d}
+                checked={depth === d}
+                onChange={() => onDepthChange(d)}
+                disabled={isRunning}
+                className="accent-blue-600"
+              />
+              <span className="text-sm text-gray-700">
+                {d === 'homepage' ? 'Homepage only' : 'In-depth'}
+              </span>
+            </label>
+          ))}
+        </div>
+      </div>
+
+      {/* â”€â”€ Contact filter â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
+      <div>
+        <span className="block text-sm font-medium text-gray-700 mb-2">Keep leads with</span>
+        <div className="flex flex-wrap gap-4" role="radiogroup" aria-label="Contact filter">
+          {(
+            [
+              { value: 'any',        label: 'Email or Phone' },
+              { value: 'email_only', label: 'Email only' },
+              { value: 'phone_only', label: 'Phone only' },
+              { value: 'both',       label: 'Both' },
+            ] as { value: ContactFilter; label: string }[]
+          ).map(({ value, label }) => (
+            <label key={value} className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="radio"
+                name="contactFilter"
+                value={value}
+                checked={contactFilter === value}
+                onChange={() => onContactFilterChange(value)}
+                disabled={isRunning}
+                className="accent-blue-600"
+                aria-label={label}
+              />
+              <span className="text-sm text-gray-700">{label}</span>
+            </label>
+          ))}
+        </div>
+      </div>
+
+      {/* â”€â”€ Action buttons â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
+      <div className="flex gap-3 pt-1">
+        <button
+          onClick={onStart}
+          disabled={isRunning || !canStart}
+          className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-1"
+          aria-label="Start scraping job"
+        >
+          <span aria-hidden="true">â–¶</span> Start
+        </button>
+        <button
+          onClick={onStop}
+          disabled={!isRunning}
+          className="flex items-center gap-2 px-4 py-2 bg-gray-700 text-white text-sm font-medium rounded hover:bg-gray-800 disabled:opacity-50 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-gray-500 focus:ring-offset-1"
+          aria-label="Stop scraping job"
+        >
+          <span aria-hidden="true">â– </span> Stop
+        </button>
+      </div>
+    </div>
+  );
+}
+
+
+===== src/components/StatusBar.tsx =====
+
+'use client';
+
+import { useEffect, useRef, useState } from 'react';
+import { JobStatus, StatusPayload } from '../types';
+
+interface StatusBarProps {
+  status: JobStatus;
+  leadCount: number;
+  discardCount: number;
+  errorMessage: string;
+  activeKeyword?: string;
+  activeLocation?: string;
+  /** Phase 14 â€” batch progress from city-batched runs. */
+  batchProgress?: StatusPayload['batchProgress'];
+  /** Max leads target â€” shown alongside lead count when set. */
+  maxLeads?: number;
+}
+
+const STATUS_LABELS: Record<JobStatus, string> = {
+  idle: 'Idle',
+  running: 'Running',
+  stopped: 'Stopped',
+  completed: 'Completed',
+  error: 'Error',
+};
+
+const STATUS_COLORS: Record<JobStatus, string> = {
+  idle: 'bg-gray-100 text-gray-600',
+  running: 'bg-blue-100 text-blue-700',
+  stopped: 'bg-yellow-100 text-yellow-700',
+  completed: 'bg-green-100 text-green-700',
+  error: 'bg-red-100 text-red-700',
+};
+
+/** Formats elapsed milliseconds as "1m 23s" or "45s". */
+function formatElapsed(ms: number): string {
+  const totalSeconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes > 0) return `${minutes}m ${seconds}s`;
+  return `${seconds}s`;
+}
+
+export default function StatusBar({
+  status,
+  leadCount,
+  discardCount,
+  errorMessage,
+  activeKeyword,
+  activeLocation,
+  batchProgress,
+  maxLeads,
+}: StatusBarProps) {
+  // â”€â”€ Elapsed time â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  const [elapsedMs, setElapsedMs] = useState(0);
+  const startTimeRef = useRef<number | null>(null);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  useEffect(() => {
+    if (status === 'running') {
+      if (startTimeRef.current === null) {
+        startTimeRef.current = Date.now();
+        setElapsedMs(0);
+      }
+      timerRef.current = setInterval(() => {
+        setElapsedMs(Date.now() - (startTimeRef.current ?? Date.now()));
+      }, 1000);
+    } else if (status === 'idle') {
+      startTimeRef.current = null;
+      setElapsedMs(0);
+      if (timerRef.current) clearInterval(timerRef.current);
+    } else {
+      if (timerRef.current) clearInterval(timerRef.current);
+    }
+
+    return () => {
+      if (timerRef.current) clearInterval(timerRef.current);
+    };
+  }, [status]);
+
+  const showElapsed = status !== 'idle' && elapsedMs > 0;
+
+  // â”€â”€ Batch progress bar percentage â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  const batchPct = batchProgress && batchProgress.totalCities > 0
+    ? Math.round((batchProgress.citiesProcessed / batchProgress.totalCities) * 100)
+    : null;
+
+  // â”€â”€ Lead progress percentage â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  const leadPct = maxLeads && maxLeads > 0
+    ? Math.min(100, Math.round((leadCount / maxLeads) * 100))
+    : null;
+
+  return (
+    <div
+      className={`rounded-lg text-sm ${STATUS_COLORS[status]}`}
+      role="status"
+      aria-live="polite"
+      aria-label={`Job status: ${STATUS_LABELS[status]}`}
+    >
+      {/* â”€â”€ Main row â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
+      <div className="flex flex-wrap items-center gap-4 px-4 py-3">
+        {/* Status badge */}
+        <span className="font-semibold">{STATUS_LABELS[status]}</span>
+
+        {/* Lead count */}
+        <span>
+          <span className="font-medium">{leadCount}</span>
+          {maxLeads ? (
+            <span className="opacity-75"> / {maxLeads} leads</span>
+          ) : (
+            <span> {leadCount === 1 ? 'lead' : 'leads'} found</span>
+          )}
+        </span>
+
+        {/* Discard count */}
+        {discardCount > 0 && (
+          <span className="opacity-75">{discardCount} discarded</span>
+        )}
+
+        {/* Batch progress */}
+        {status === 'running' && batchProgress && (
+          <span
+            className="opacity-75 text-xs font-mono bg-blue-200 text-blue-800 px-2 py-0.5 rounded"
+            aria-label={`Batch ${batchProgress.currentBatch} of ${batchProgress.totalBatches}, city ${batchProgress.citiesProcessed + 1} of ${batchProgress.totalCities}`}
+          >
+            Batch {batchProgress.currentBatch}/{batchProgress.totalBatches} Â· City {batchProgress.citiesProcessed + 1}/{batchProgress.totalCities}
+          </span>
+        )}
+
+        {/* Active keyword + location */}
+        {status === 'running' && (activeKeyword || activeLocation) && (
+          <span
+            className="opacity-75 text-xs font-mono bg-blue-200 text-blue-800 px-2 py-0.5 rounded"
+            aria-label={`Scanning: ${activeKeyword} in ${activeLocation}`}
+          >
+            ðŸ” {activeKeyword}{activeKeyword && activeLocation ? ' Â· ' : ''}{activeLocation}
+          </span>
+        )}
+
+        {/* Elapsed time */}
+        {showElapsed && (
+          <span className="opacity-75" aria-label={`Time elapsed: ${formatElapsed(elapsedMs)}`}>
+            â± {formatElapsed(elapsedMs)}
+          </span>
+        )}
+
+        {/* Running spinner */}
+        {status === 'running' && (
+          <span
+            className="inline-block w-3 h-3 border-2 border-blue-600 border-t-transparent rounded-full animate-spin"
+            aria-hidden="true"
+          />
+        )}
+
+        {/* Error message */}
+        {errorMessage && (
+          <span className="text-red-600 font-medium" role="alert">
+            âš  {errorMessage}
+          </span>
+        )}
+      </div>
+
+      {/* â”€â”€ Progress bars (city-batched runs) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
+      {status === 'running' && (batchPct !== null || leadPct !== null) && (
+        <div className="px-4 pb-3 space-y-1.5">
+          {/* Cities progress */}
+          {batchPct !== null && batchProgress && (
+            <div>
+              <div className="flex justify-between text-xs opacity-70 mb-0.5">
+                <span>Cities</span>
+                <span>{batchProgress.citiesProcessed}/{batchProgress.totalCities}</span>
+              </div>
+              <div className="w-full bg-blue-200 rounded-full h-1.5" role="progressbar" aria-valuenow={batchPct} aria-valuemin={0} aria-valuemax={100}>
+                <div
+                  className="bg-blue-600 h-1.5 rounded-full transition-all duration-500"
+                  style={{ width: `${batchPct}%` }}
+                />
+              </div>
+            </div>
+          )}
+
+          {/* Leads progress */}
+          {leadPct !== null && (
+            <div>
+              <div className="flex justify-between text-xs opacity-70 mb-0.5">
+                <span>Leads</span>
+                <span>{leadCount}/{maxLeads}</span>
+              </div>
+              <div className="w-full bg-blue-200 rounded-full h-1.5" role="progressbar" aria-valuenow={leadPct} aria-valuemin={0} aria-valuemax={100}>
+                <div
+                  className="bg-green-500 h-1.5 rounded-full transition-all duration-500"
+                  style={{ width: `${leadPct}%` }}
+                />
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+===== src/app/page.tsx =====
+
+'use client';
+
+import { useState, useCallback } from 'react';
+import InputPanel from '../components/InputPanel';
+import StatusBar from '../components/StatusBar';
+import ResultsTable from '../components/ResultsTable';
+import ExportButton from '../components/ExportButton';
+import { useSSE } from '../hooks/useSSE';
+import {
+  Lead,
+  JobStatus,
+  ScrapeDepth,
+  ContactFilter,
+  DiscardPayload,
+  StatusPayload,
+  ErrorPayload,
+} from '../types';
+
+const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? '';
+
+export default function DashboardPage() {
+  // â”€â”€ Form state (Phase 13) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  const [profession, setProfession] = useState<string>('');
+  const [country, setCountry] = useState<string>('');         // ISO code
+  const [countryName, setCountryName] = useState<string>(''); // display name
+  const [states, setStates] = useState<string[]>([]);
+  const [maxLeads, setMaxLeads] = useState<number>(100);
+  const [depth, setDepth] = useState<ScrapeDepth>('homepage');
+  const [contactFilter, setContactFilter] = useState<ContactFilter>('any');
+
+  function handleCountryChange(isoCode: string, name: string) {
+    setCountry(isoCode);
+    setCountryName(name);
+    setStates([]); // reset states when country changes
+  }
+
+  // â”€â”€ Job state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  const [jobId, setJobId] = useState<string | null>(null);
+  const [jobStatus, setJobStatus] = useState<JobStatus>('idle');
+  const [leads, setLeads] = useState<Lead[]>([]);
+  const [discardCount, setDiscardCount] = useState(0);
+  const [activeKeyword, setActiveKeyword] = useState('');
+  const [activeLocation, setActiveLocation] = useState('');
+  const [batchProgress, setBatchProgress] = useState<StatusPayload['batchProgress']>(undefined);
+
+  // â”€â”€ Error state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  const [locationError, setLocationError] = useState('');
+  const [errorMessage, setErrorMessage] = useState('');
+
+  const isRunning = jobStatus === 'running';
+
+  // â”€â”€ SSE handlers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  const handleLead = useCallback((lead: Lead) => {
+    setLeads((prev) => [...prev, lead]);
+  }, []);
+
+  const handleDiscard = useCallback((payload: DiscardPayload) => {
+    setDiscardCount(payload.total);
+  }, []);
+
+  const handleStatus = useCallback((payload: StatusPayload) => {
+    setJobStatus(payload.status);
+    setDiscardCount(payload.discardCount);
+    if (payload.activeKeyword !== undefined) setActiveKeyword(payload.activeKeyword);
+    if (payload.activeLocation !== undefined) setActiveLocation(payload.activeLocation);
+    if (payload.batchProgress !== undefined) setBatchProgress(payload.batchProgress);
+  }, []);
+
+  const handleError = useCallback((payload: ErrorPayload) => {
+    setErrorMessage(payload.message);
+  }, []);
+
+  useSSE(jobId, {
+    onLead: handleLead,
+    onDiscard: handleDiscard,
+    onStatus: handleStatus,
+    onError: handleError,
+  });
+
+  // â”€â”€ Start job â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  async function handleStart() {
+    setLocationError('');
+    setErrorMessage('');
+    setLeads([]);
+    setDiscardCount(0);
+    setJobId(null);
+    setActiveKeyword('');
+    setActiveLocation('');
+    setBatchProgress(undefined);
+
+    // profession field is the keyword directly (free text)
+    const keyword = profession.trim();
+    if (!keyword) {
+      setErrorMessage('Please enter a keyword or profession.');
+      return;
+    }
+    if (!country) {
+      setLocationError('Please select a country.');
+      return;
+    }
+    if (states.length === 0) {
+      setLocationError('Please add at least one state or region.');
+      return;
+    }
+
+    try {
+      const res = await fetch(`${API_BASE}/api/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          keyword,
+          country: country.trim(),
+          states,
+          maxLeads,
+          depth,
+          contactFilter,
+        }),
+      });
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        if (data.error === 'invalid_location') {
+          setLocationError(data.message ?? 'Invalid location. Please try again.');
+        } else {
+          setErrorMessage(data.message ?? 'Failed to start job.');
+        }
+        return;
+      }
+
+      setJobId(data.jobId);
+      setJobStatus('running');
+    } catch {
+      setErrorMessage('Could not connect to the backend. Is it running?');
+    }
+  }
+
+  // â”€â”€ Stop job â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  async function handleStop() {
+    try {
+      await fetch(`${API_BASE}/api/stop`, { method: 'POST' });
+    } catch {
+      setErrorMessage('Failed to send stop signal.');
+    }
+  }
+
+  return (
+    <main className="min-h-screen p-6 max-w-7xl mx-auto space-y-5">
+      {/* Header */}
+      <header>
+        <h1 className="text-2xl font-bold text-gray-900 tracking-tight">
+          Lead Scraper
+        </h1>
+        <p className="text-sm text-gray-500 mt-0.5">
+          In-house lead generation â€” public data only
+        </p>
+      </header>
+
+      {/* Input panel */}
+      <InputPanel
+        profession={profession}
+        country={country}
+        countryName={countryName}
+        states={states}
+        maxLeads={maxLeads}
+        depth={depth}
+        contactFilter={contactFilter}
+        locationError={locationError}
+        isRunning={isRunning}
+        onProfessionChange={setProfession}
+        onCountryChange={handleCountryChange}
+        onStatesChange={setStates}
+        onMaxLeadsChange={setMaxLeads}
+        onDepthChange={setDepth}
+        onContactFilterChange={setContactFilter}
+        onStart={handleStart}
+        onStop={handleStop}
+      />
+
+      {/* Status bar */}
+      <StatusBar
+        status={jobStatus}
+        leadCount={leads.length}
+        discardCount={discardCount}
+        errorMessage={errorMessage}
+        activeKeyword={activeKeyword}
+        activeLocation={activeLocation}
+        batchProgress={batchProgress}
+        maxLeads={maxLeads}
+      />
+
+      {/* Export button + discard note */}
+      <div className="flex items-center justify-between flex-wrap gap-3">
+        <ExportButton
+          jobId={jobId ?? ''}
+          leadCount={leads.length}
+          status={jobStatus}
+        />
+        {discardCount > 0 && (
+          <p className="text-sm text-gray-500" aria-live="polite">
+            {discardCount} lead{discardCount !== 1 ? 's' : ''} discarded â€” no email or phone found
+          </p>
+        )}
+      </div>
+
+      {/* Results table */}
+      <ResultsTable leads={leads} />
+
+      {/* Footer */}
+      <footer className="text-xs text-gray-400 pt-4 border-t border-gray-200">
+        Data is held in memory only. Export before stopping the server.
+      </footer>
+    </main>
+  );
+}

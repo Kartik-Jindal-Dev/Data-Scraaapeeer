@@ -3,13 +3,17 @@
  * Lightweight robots.txt compliance checker.
  *
  * Behaviour:
- * - Fetches robots.txt once per domain per job run (in-memory cache).
+ * - Fetches robots.txt once per domain per job run (in-memory cache, 24h TTL).
  * - If RESPECT_ROBOTS_TXT=true (default), checks whether the URL is allowed.
  * - If disallowed: logs and returns false — caller skips scraping for that URL.
  * - Does NOT block the pipeline — a disallowed URL is treated like an
  *   unreachable site (lead may still qualify via discovery-phase phone).
  * - Cache is module-level (persists across leads in the same process).
  *   A new process starts with an empty cache.
+ *
+ * Phase 3.2: 24-hour TTL added to cache entries. Stale entries are evicted
+ * on next access, preventing indefinitely-cached robots.txt from blocking
+ * newly-allowed paths after a site updates its rules.
  *
  * Uses a simple manual parser — no external robots-parser dependency.
  * Checks against 'Googlebot' user-agent (standard for public scrapers).
@@ -22,17 +26,31 @@ import { logger } from '../logger';
 
 // ─── Cache ────────────────────────────────────────────────────────────────────
 
+/** Phase 3.2: robots.txt cache entry with 24-hour TTL. */
+interface RobotsCacheEntry {
+  content: string;
+  fetchedAt: number; // Unix ms timestamp
+}
+
 /** robots.txt content keyed by origin (e.g. "https://example.com"). */
-const robotsCache = new Map<string, string>();
+const robotsCache = new Map<string, RobotsCacheEntry>();
 
 const ROBOTS_FETCH_TIMEOUT_MS = 5_000;
+const ROBOTS_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const USER_AGENT_TOKEN = 'Googlebot'; // token to check rules against
 
 // ─── Fetch robots.txt ─────────────────────────────────────────────────────────
 
 async function fetchRobotsTxt(origin: string): Promise<string> {
-  if (robotsCache.has(origin)) {
-    return robotsCache.get(origin)!;
+  // Phase 3.2: check TTL — evict stale entries before returning cached content
+  const cached = robotsCache.get(origin);
+  if (cached) {
+    const age = Date.now() - cached.fetchedAt;
+    if (age < ROBOTS_CACHE_TTL_MS) {
+      return cached.content;
+    }
+    // Stale — evict and re-fetch
+    robotsCache.delete(origin);
   }
 
   const robotsUrl = `${origin}/robots.txt`;
@@ -48,17 +66,17 @@ async function fetchRobotsTxt(origin: string): Promise<string> {
 
     if (!res.ok) {
       // Non-200 (e.g. 404) → no robots.txt → everything allowed
-      robotsCache.set(origin, '');
+      robotsCache.set(origin, { content: '', fetchedAt: Date.now() });
       return '';
     }
 
     const text = await res.text();
-    robotsCache.set(origin, text);
+    robotsCache.set(origin, { content: text, fetchedAt: Date.now() });
     return text;
   } catch {
     clearTimeout(timer);
-    // Timeout or network error → fail-open
-    robotsCache.set(origin, '');
+    // Timeout or network error → fail-open, cache empty result briefly
+    robotsCache.set(origin, { content: '', fetchedAt: Date.now() });
     return '';
   }
 }
@@ -172,4 +190,12 @@ export async function isAllowedByRobots(url: string): Promise<boolean> {
  */
 export function clearRobotsCache(): void {
   robotsCache.clear();
+}
+
+/**
+ * Returns the current number of cached robots.txt entries.
+ * Useful for monitoring cache effectiveness.
+ */
+export function getRobotsCacheSize(): number {
+  return robotsCache.size;
 }

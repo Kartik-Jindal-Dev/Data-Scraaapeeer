@@ -32,12 +32,15 @@ const HYPERLINK_COLOR_ARGB = 'FF1565C0';
 // ─── Column Definitions ───────────────────────────────────────────────────────
 
 const COLUMNS: Partial<ExcelJS.Column>[] = [
-  { header: 'Business Name', key: 'businessName', width: 32 },
-  { header: 'Email',         key: 'email',         width: 30 },
-  { header: 'Phone',         key: 'phone',         width: 20 },
-  { header: 'Website',       key: 'website',       width: 32 },
-  { header: 'Address',       key: 'address',       width: 38 },
+  { header: 'Business Name', key: 'businessName',  width: 32 },
+  { header: 'Email',         key: 'email',          width: 30 },
+  { header: 'Phone',         key: 'phone',          width: 20 },
+  { header: 'Website',       key: 'website',        width: 32 },
+  { header: 'Address',       key: 'address',        width: 38 },
   { header: 'Contact Form',  key: 'hasContactForm', width: 14 },
+  { header: 'Generic Email', key: 'isGenericEmail', width: 14 },
+  { header: 'Free Email',    key: 'isFreeEmail',    width: 12 },
+  { header: 'Relay Email',   key: 'isRelayEmail',   width: 12 },
 ];
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -77,6 +80,9 @@ function addLeadRow(ws: ExcelJS.Worksheet, lead: Lead): ExcelJS.Row {
     website:      lead.website || '',
     address:      lead.address,
     hasContactForm: lead.hasContactForm ? 'Yes' : '',
+    isGenericEmail: lead.isGenericEmail ? 'Yes' : '',
+    isFreeEmail:    lead.isFreeEmail    ? 'Yes' : '',
+    isRelayEmail:   lead.isRelayEmail   ? 'Yes' : '',
   });
 
   // Green highlight for Tier 1 leads (both email + phone)
@@ -124,7 +130,7 @@ export async function generateExcelBuffer(leads: Lead[]): Promise<Buffer> {
   ws.views = [{ state: 'frozen', ySplit: 1 }];
 
   // Auto-filter on header row
-  ws.autoFilter = { from: 'A1', to: 'F1' };
+  ws.autoFilter = { from: 'A1', to: 'I1' };
 
   const sorted = sortLeads(leads);
   for (const lead of sorted) {
@@ -160,6 +166,9 @@ export async function generateExcelStreaming(
       website:      lead.website || '',
       address:      lead.address,
       hasContactForm: lead.hasContactForm ? 'Yes' : '',
+      isGenericEmail: lead.isGenericEmail ? 'Yes' : '',
+      isFreeEmail:    lead.isFreeEmail    ? 'Yes' : '',
+      isRelayEmail:   lead.isRelayEmail   ? 'Yes' : '',
     });
 
     if (lead._hasBoth) {

@@ -23,6 +23,8 @@ import { stopRouter } from './routes/stop';
 import { statusRouter } from './routes/status';
 import { streamRouter } from './routes/stream';
 import { exportRouter } from './routes/export';
+import { exportStreamRouter } from './routes/exportStream';
+import { locationsRouter } from './routes/locations';
 
 // ─── App Setup ────────────────────────────────────────────────────────────────
 
@@ -53,11 +55,13 @@ app.get('/health', (_req, res) => {
 
 // ─── API Routes ───────────────────────────────────────────────────────────────
 
-app.use('/api/start',  startRouter);
-app.use('/api/stop',   stopRouter);
-app.use('/api/status', statusRouter);
-app.use('/api/stream', streamRouter);
-app.use('/api/export', exportRouter);
+app.use('/api/start',          startRouter);
+app.use('/api/stop',           stopRouter);
+app.use('/api/status',         statusRouter);
+app.use('/api/stream',         streamRouter);
+app.use('/api/export/stream',  exportStreamRouter);
+app.use('/api/export',         exportRouter);
+app.use('/api/locations',      locationsRouter);
 
 // ─── 404 Handler ─────────────────────────────────────────────────────────────
 
@@ -104,5 +108,30 @@ function shutdown(signal: string): void {
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT',  () => shutdown('SIGINT'));
+
+// ─── Playwright CDP Crash Guard ───────────────────────────────────────────────
+// playwright-extra's puppeteer compatibility shim can throw unhandled promise
+// rejections (cdpSession.send: Target page, context or browser has been closed)
+// when a browser is closed while a page operation is still in flight.
+// These are benign — the scraper already handles them via try/catch — but Node
+// will crash the process if they go unhandled. We catch and log them here.
+process.on('unhandledRejection', (reason: unknown) => {
+  const msg = reason instanceof Error ? reason.message : String(reason);
+  const isCdpCrash =
+    msg.includes('cdpSession.send') ||
+    msg.includes('Target page, context or browser has been closed') ||
+    msg.includes('browser has been closed') ||
+    msg.includes('context has been closed') ||
+    msg.includes('Target closed') ||
+    msg.includes('Session closed');
+
+  if (isCdpCrash) {
+    logger.warn(`Scraper: suppressed Playwright CDP rejection — ${msg.slice(0, 120)}`);
+    return; // swallow — not a real crash
+  }
+
+  // All other unhandled rejections are real errors — log and let Node handle them
+  logger.error(`Unhandled rejection: ${msg}`);
+});
 
 export default app;

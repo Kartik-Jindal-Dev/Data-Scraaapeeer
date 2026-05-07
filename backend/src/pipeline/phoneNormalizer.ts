@@ -18,7 +18,8 @@
 import { parsePhoneNumberFromString, CountryCode } from 'libphonenumber-js';
 import { logger } from '../logger';
 import { store } from '../store';
-import { extractFromJsonLd } from './emailExtractor';
+import * as cheerio from 'cheerio';
+import { extractFromJsonLd, truncateHtmlIfNeeded } from './emailExtractor';
 
 // ─── Phone Regex Patterns ─────────────────────────────────────────────────────
 
@@ -97,6 +98,7 @@ function extractPhoneFromText(text: string, isoCode: string): string {
  * @param pageHtml          - Full HTML of the scraped page (may be empty)
  * @param isoCode           - ISO 3166-1 alpha-2 country code from Nominatim geocoder
  * @param businessName      - Used for logging only
+ * @param parsed$           - Optional pre-parsed Cheerio instance (avoids re-parsing)
  * @returns                 - E.164 phone string, or empty string if none found
  *
  * Side effects:
@@ -106,7 +108,8 @@ export function extractPhone(
   rawDiscoveryPhone: string,
   pageHtml: string,
   isoCode: string,
-  businessName: string
+  businessName: string,
+  parsed$?: ReturnType<typeof cheerio.load>
 ): string {
   // ── Priority 1: discovery phone ───────────────────────────────────────────
   if (rawDiscoveryPhone && rawDiscoveryPhone.trim().length > 0) {
@@ -122,7 +125,9 @@ export function extractPhone(
 
   // ── Priority 1.5: JSON-LD structured data ────────────────────────────────
   if (pageHtml && pageHtml.trim().length > 0) {
-    const jsonLdData = extractFromJsonLd(pageHtml);
+    // Phase 5.5: truncate oversized HTML before parsing
+    const safeHtml = truncateHtmlIfNeeded(pageHtml);
+    const jsonLdData = extractFromJsonLd(safeHtml, parsed$);
     if (jsonLdData.phone) {
       const normalised = normalisePhone(jsonLdData.phone, isoCode);
       if (normalised) {
@@ -134,8 +139,10 @@ export function extractPhone(
 
   // ── Priority 2: website page text ─────────────────────────────────────────
   if (pageHtml && pageHtml.trim().length > 0) {
+    // Phase 5.5: truncate oversized HTML before text extraction
+    const safeHtml = truncateHtmlIfNeeded(pageHtml);
     // Strip HTML tags to get visible text for phone regex scanning
-    const textContent = pageHtml
+    const textContent = safeHtml
       .replace(/<script[\s\S]*?<\/script>/gi, ' ')
       .replace(/<style[\s\S]*?<\/style>/gi, ' ')
       .replace(/<[^>]+>/g, ' ')

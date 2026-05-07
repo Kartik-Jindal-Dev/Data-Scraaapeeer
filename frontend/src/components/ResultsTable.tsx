@@ -6,6 +6,10 @@ interface ResultsTableProps {
   leads: Lead[];
 }
 
+// Show at most this many rows in the live table to keep the browser responsive.
+// All leads are still stored in memory and exported to Excel in full.
+const TABLE_DISPLAY_LIMIT = 500;
+
 export default function ResultsTable({ leads }: ResultsTableProps) {
   if (leads.length === 0) {
     return (
@@ -15,8 +19,20 @@ export default function ResultsTable({ leads }: ResultsTableProps) {
     );
   }
 
+  // Only render the most recent TABLE_DISPLAY_LIMIT leads in the DOM.
+  // Older leads are still in memory and will appear in the export.
+  const displayLeads = leads.length > TABLE_DISPLAY_LIMIT
+    ? leads.slice(-TABLE_DISPLAY_LIMIT)
+    : leads;
+  const hiddenCount = leads.length - displayLeads.length;
+
   return (
     <div className="overflow-x-auto rounded-lg border border-gray-200">
+      {hiddenCount > 0 && (
+        <div className="px-4 py-2 bg-blue-50 text-blue-700 text-xs border-b border-blue-100">
+          Showing latest {TABLE_DISPLAY_LIMIT} of {leads.length} leads — all {leads.length} will be in the export.
+        </div>
+      )}
       <table className="min-w-full text-sm" aria-label="Leads results table">
         <thead className="bg-gray-800 text-white">
           <tr>
@@ -41,7 +57,7 @@ export default function ResultsTable({ leads }: ResultsTableProps) {
           </tr>
         </thead>
         <tbody>
-          {leads.map((lead, idx) => {
+          {displayLeads.map((lead, idx) => {
             const hasBoth = !!lead.email && !!lead.phone;
             return (
               <tr

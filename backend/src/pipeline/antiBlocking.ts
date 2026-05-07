@@ -18,8 +18,8 @@
  * - Budget: $0 (no proxy) or up to $5–6/month if PROXY_URL is set.
  */
 
-import { chromium as playwrightChromium } from 'playwright';
-import { logger } from '../logger';
+import { chromium as playwrightChromium } from "playwright";
+import { logger } from "../logger";
 
 // ─── Try to load playwright-extra + stealth ───────────────────────────────────
 // Wrapped in try/catch so the system degrades gracefully if the package is
@@ -32,15 +32,16 @@ async function loadStealthChromium(): Promise<typeof playwrightChromium> {
 
   try {
     // Dynamic import to avoid hard dependency at module load time
-    const { chromium: extra } = await import('playwright-extra');
-    const StealthPlugin = (await import('puppeteer-extra-plugin-stealth')).default;
+    const { chromium: extra } = await import("playwright-extra");
+    const StealthPlugin = (await import("puppeteer-extra-plugin-stealth"))
+      .default;
     extra.use(StealthPlugin());
     stealthChromium = extra as unknown as typeof playwrightChromium;
-    logger.info('AntiBlocking: stealth plugin loaded');
+    logger.info("AntiBlocking: stealth plugin loaded");
     return stealthChromium;
   } catch (err) {
     logger.warn(
-      `AntiBlocking: playwright-extra not available (${(err as Error).message}) — falling back to plain Playwright`
+      `AntiBlocking: playwright-extra not available (${(err as Error).message}) — falling back to plain Playwright`,
     );
     stealthChromium = playwrightChromium;
     return stealthChromium;
@@ -55,19 +56,19 @@ async function loadStealthChromium(): Promise<typeof playwrightChromium> {
  */
 const USER_AGENTS: string[] = [
   // Chrome on Windows
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
   // Chrome on macOS
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
   // Firefox on Windows
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0',
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
   // Edge on Windows
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0',
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
   // Chrome on Linux
-  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
 ];
 
 /** Returns a random user-agent string from the pool. */
@@ -98,14 +99,15 @@ export function pickViewport(): { width: number; height: number } {
  */
 export function getExtraHeaders(): Record<string, string> {
   return {
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Accept-Encoding': 'gzip, deflate, br',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-    'Upgrade-Insecure-Requests': '1',
-    'Sec-Fetch-Dest': 'document',
-    'Sec-Fetch-Mode': 'navigate',
-    'Sec-Fetch-Site': 'none',
-    'Sec-Fetch-User': '?1',
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    Accept:
+      "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
   };
 }
 
@@ -133,10 +135,14 @@ export function getProxyConfig():
     };
     if (parsed.username) config.username = decodeURIComponent(parsed.username);
     if (parsed.password) config.password = decodeURIComponent(parsed.password);
-    logger.info(`AntiBlocking: proxy configured — ${parsed.protocol}//${parsed.host}`);
+    logger.info(
+      `AntiBlocking: proxy configured — ${parsed.protocol}//${parsed.host}`,
+    );
     return config;
   } catch {
-    logger.warn(`AntiBlocking: invalid PROXY_URL "${proxyUrl}" — proxy disabled`);
+    logger.warn(
+      `AntiBlocking: invalid PROXY_URL "${proxyUrl}" — proxy disabled`,
+    );
     return undefined;
   }
 }
@@ -164,9 +170,15 @@ export interface StealthBrowserOptions {
  *
  * @returns { browser, context } — caller is responsible for closing both.
  */
-export async function createStealthBrowser(opts: StealthBrowserOptions = {}): Promise<{
+export async function createStealthBrowser(
+  opts: StealthBrowserOptions = {},
+): Promise<{
   browser: Awaited<ReturnType<typeof playwrightChromium.launch>>;
-  context: Awaited<ReturnType<Awaited<ReturnType<typeof playwrightChromium.launch>>['newContext']>>;
+  context: Awaited<
+    ReturnType<
+      Awaited<ReturnType<typeof playwrightChromium.launch>>["newContext"]
+    >
+  >;
 }> {
   const chromium = await loadStealthChromium();
   const proxy = getProxyConfig();
@@ -175,20 +187,20 @@ export async function createStealthBrowser(opts: StealthBrowserOptions = {}): Pr
 
   logger.info(
     `AntiBlocking: launching browser — UA="${userAgent.slice(0, 60)}..." ` +
-    `viewport=${viewport.width}x${viewport.height} proxy=${proxy ? proxy.server : 'none'}`
+      `viewport=${viewport.width}x${viewport.height} proxy=${proxy ? proxy.server : "none"}`,
   );
 
   const browser = await chromium.launch({
     headless: true,
     args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-blink-features=AutomationControlled',
-      '--disable-infobars',
-      '--disable-dev-shm-usage',
-      '--disable-accelerated-2d-canvas',
-      '--no-first-run',
-      '--no-zygote',
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-blink-features=AutomationControlled",
+      "--disable-infobars",
+      "--disable-dev-shm-usage",
+      "--disable-accelerated-2d-canvas",
+      "--no-first-run",
+      "--no-zygote",
     ],
     ...(proxy ? { proxy } : {}),
   });
@@ -196,8 +208,8 @@ export async function createStealthBrowser(opts: StealthBrowserOptions = {}): Pr
   const context = await browser.newContext({
     userAgent,
     viewport,
-    locale: 'en-US',
-    timezoneId: 'America/New_York',
+    locale: "en-US",
+    timezoneId: "America/New_York",
     ignoreHTTPSErrors: opts.ignoreHTTPSErrors ?? false,
     extraHTTPHeaders: getExtraHeaders(),
     ...(proxy ? { proxy } : {}),
@@ -205,7 +217,7 @@ export async function createStealthBrowser(opts: StealthBrowserOptions = {}): Pr
 
   // Mask navigator.webdriver via init script (belt-and-suspenders alongside stealth plugin)
   await context.addInitScript(() => {
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     delete (window as any).cdc_adoQpoasnfa76pfcZLmcfl_Array;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any

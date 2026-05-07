@@ -4,9 +4,15 @@
  *
  * CONSTRAINTS (from docs/CONSTRAINTS.md §5):
  * - Filter runs ONLY after ALL scraping + extraction steps are complete.
- * - A lead is discarded ONLY if both email AND phone are empty after all steps.
+ * - A lead is discarded based on the contactFilter mode chosen by the operator.
  * - Discarding before all steps are complete is a bug.
  * - _hasBoth and _qualityTier are INTERNAL ONLY — never exported or in SSE payloads.
+ *
+ * Contact filter modes:
+ *   any        — keep if email OR phone present (default)
+ *   email_only — keep only if email is present
+ *   phone_only — keep only if phone is present
+ *   both       — keep only if BOTH email AND phone are present
  *
  * On pass:  push to store.leads[], emit SSE `lead` event (PublicLead only)
  * On fail:  increment discard_no_contact, emit SSE `discard` event, log
@@ -15,8 +21,8 @@
 import { logger } from '../logger';
 import { store } from '../store';
 import { emitDiscard, emitLead } from '../sse';
-import { Lead, QualityTier, RawLead } from '../types';
-import { detectContactForm } from './emailExtractor';
+import { ContactFilter, Lead, QualityTier, RawLead } from '../types';
+import { detectContactForm, classifyEmailBounceRisk } from './emailExtractor';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -36,8 +42,6 @@ export interface ExtractedLead {
  * Tier1 — both email AND phone present
  * Tier2 — email only
  * Tier3 — phone only
- *
- * Never called for leads with neither (those are discarded before this).
  */
 export function assignQualityTier(email: string, phone: string): QualityTier {
   if (email && phone) return 'Tier1';
@@ -45,37 +49,64 @@ export function assignQualityTier(email: string, phone: string): QualityTier {
   return 'Tier3';
 }
 
+// ─── Contact Filter Check ─────────────────────────────────────────────────────
+
+/**
+ * Returns true if the lead passes the operator-chosen contact filter.
+ *
+ * any        — email OR phone present
+ * email_only — email must be present (phone optional)
+ * phone_only — phone must be present (email optional)
+ * both       — BOTH email AND phone must be present
+ */
+export function passesContactFilter(
+  email: string,
+  phone: string,
+  mode: ContactFilter
+): boolean {
+  switch (mode) {
+    case 'email_only': return !!email;
+    case 'phone_only': return !!phone;
+    case 'both':       return !!email && !!phone;
+    case 'any':
+    default:           return !!(email || phone);
+  }
+}
+
+// ─── Discard Reason Helper ────────────────────────────────────────────────────
+
+function discardReason(mode: ContactFilter): string {
+  switch (mode) {
+    case 'email_only': return 'no email found (email_only filter)';
+    case 'phone_only': return 'no phone found (phone_only filter)';
+    case 'both':       return 'missing email or phone (both filter)';
+    default:           return 'no email or phone found';
+  }
+}
+
 // ─── Main Filter Function ─────────────────────────────────────────────────────
 
 /**
  * Applies the post-scrape filter to a single extracted lead.
  *
- * If the lead has at least one contact method (email OR phone):
- *   - Builds the Lead object with quality tier and _hasBoth flag
- *   - Pushes to store.leads[]
- *   - Emits SSE `lead` event (public fields only — no _hasBoth, no _qualityTier)
- *   - Returns true (lead accepted)
- *
- * If the lead has neither email nor phone:
- *   - Increments discard_no_contact metric
- *   - Emits SSE `discard` event with updated stats
- *   - Logs the discard with business name and reason
- *   - Returns false (lead discarded)
- *
- * @param jobId   - Used for SSE event emission
- * @param lead    - Extracted lead with email and phone fields
+ * @param jobId          - Used for SSE event emission
+ * @param lead           - Extracted lead with email and phone fields
+ * @param contactFilter  - Filter mode from JobContext (defaults to 'any')
  */
-export function processLead(jobId: string, lead: ExtractedLead): boolean {
+export function processLead(
+  jobId: string,
+  lead: ExtractedLead,
+  contactFilter: ContactFilter = 'any'
+): boolean {
   const { raw, email, phone } = lead;
-  // ── Filter: discard if no contact method ─────────────────────────────────
-  if (!email && !phone) {
+
+  // ── Filter: discard if lead doesn't meet the chosen contact requirement ────
+  if (!passesContactFilter(email, phone, contactFilter)) {
     store.incrementDiscard();
     store.incrementMetric('discard_no_contact');
 
     const stats = store.getStats();
-    logger.info(
-      `Filter: discarded "${raw.name}" — no email or phone found`
-    );
+    logger.info(`Filter: discarded "${raw.name}" — ${discardReason(contactFilter)}`);
 
     emitDiscard(jobId, {
       total: stats.discardCount,
@@ -90,6 +121,16 @@ export function processLead(jobId: string, lead: ExtractedLead): boolean {
   const _qualityTier = assignQualityTier(email, phone);
   const _hasBoth = _qualityTier === 'Tier1';
 
+  // ── Bounce-risk classification ────────────────────────────────────────────
+  // Derive the company root domain from the website URL for relay/alias checks.
+  const { parse: parseTld } = require('tldts') as typeof import('tldts');
+  const companyRootDomain = raw.website
+    ? (parseTld(raw.website)?.domain ?? '')
+    : '';
+  const bounceClass = email
+    ? classifyEmailBounceRisk(email, companyRootDomain)
+    : { email: '', isGenericEmail: false, isFreeEmail: false, isRelayEmail: false };
+
   // ── Build Lead object ─────────────────────────────────────────────────────
   const qualifiedLead: Lead = {
     businessName: raw.name,
@@ -100,6 +141,9 @@ export function processLead(jobId: string, lead: ExtractedLead): boolean {
     _hasBoth,
     _qualityTier,
     hasContactForm: !email ? detectContactForm(lead.html ?? '') : false,
+    isGenericEmail: bounceClass.isGenericEmail || undefined,
+    isFreeEmail:    bounceClass.isFreeEmail    || undefined,
+    isRelayEmail:   bounceClass.isRelayEmail   || undefined,
   };
 
   // ── Push to store ─────────────────────────────────────────────────────────
@@ -113,11 +157,14 @@ export function processLead(jobId: string, lead: ExtractedLead): boolean {
     website:      qualifiedLead.website,
     address:      qualifiedLead.address,
     hasContactForm: qualifiedLead.hasContactForm,
+    isGenericEmail: qualifiedLead.isGenericEmail,
+    isFreeEmail:    qualifiedLead.isFreeEmail,
+    isRelayEmail:   qualifiedLead.isRelayEmail,
   });
 
   logger.info(
     `Filter: accepted "${raw.name}" — tier=${_qualityTier} ` +
-    `email="${email || '(none)'}" phone="${phone || '(none)'}"`
+    `email="${email || '(none)'}" phone="${phone || '(none)'}" filter=${contactFilter}`
   );
 
   return true;
