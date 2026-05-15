@@ -36,6 +36,12 @@ test-results/
 storage/
 .crawlee/
 
+# ─── Database ─────────────────────────────────────────────────────────────────
+data/
+*.db
+*.db-wal
+*.db-shm
+
 # ─── Exports / Scraped Data ───────────────────────────────────────────────────
 exports/
 *.xlsx

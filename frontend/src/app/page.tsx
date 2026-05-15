@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useCallback } from 'react';
+import Link from 'next/link';
 import InputPanel from '../components/InputPanel';
 import StatusBar from '../components/StatusBar';
 import ResultsTable from '../components/ResultsTable';
@@ -157,13 +158,21 @@ export default function DashboardPage() {
   return (
     <main className="min-h-screen p-6 max-w-7xl mx-auto space-y-5">
       {/* Header */}
-      <header>
-        <h1 className="text-2xl font-bold text-gray-900 tracking-tight">
-          Lead Scraper
-        </h1>
-        <p className="text-sm text-gray-500 mt-0.5">
-          In-house lead generation — public data only
-        </p>
+      <header className="flex items-start justify-between">
+        <div>
+          <h1 className="text-2xl font-bold text-gray-900 tracking-tight">
+            Lead Scraper
+          </h1>
+          <p className="text-sm text-gray-500 mt-0.5">
+            In-house lead generation — public data only
+          </p>
+        </div>
+        <Link
+          href="/jobs"
+          className="text-sm text-indigo-600 hover:text-indigo-800 underline mt-1"
+        >
+          Job History →
+        </Link>
       </header>
 
       {/* Input panel */}

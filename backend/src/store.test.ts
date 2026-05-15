@@ -129,6 +129,8 @@ describe('store.isDuplicate()', () => {
   });
 
   it('treats different keys as distinct', () => {
+    // Clear DB before this test to avoid cross-test pollution
+    DedupRepository.clearAll();
     store.isDuplicate('+12025551234|acme.com');
     expect(store.isDuplicate('+12025551235|acme.com')).toBe(false);
     expect(store.isDuplicate('+12025551234|beta.com')).toBe(false);

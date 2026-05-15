@@ -426,8 +426,55 @@ Prevents re-scraping cities that were already visited for the same keyword withi
 - Run 2 (same day, same keyword+state): Albuquerque is skipped → moves to next unvisited city
 - Day 16+: visit window expires → Albuquerque is eligible again
 
-**Key format:** `lawyer:albuquerque:US`  
+**Key format:** `lawyer:albuquerque:US`
+
+---
+
+### Phase 21 — Database Integration (SQLite) ✅ COMPLETE (Backend)
+
+Replaces in-memory storage with persistent SQLite database to survive server restarts and enable job history tracking.
+
+| Module                                           | Status      | Notes                                                                  |
+| ------------------------------------------------ | ----------- | ---------------------------------------------------------------------- |
+| `better-sqlite3` installed                       | ✅ Complete | Zero-configuration embedded database                                   |
+| `backend/src/db/db.ts` — connection singleton    | ✅ Complete | WAL mode enabled, foreign keys on                                      |
+| `backend/src/db/db.ts` — schema initialization   | ✅ Complete | Tables: jobs, leads, dedup_records, failure_metrics, schema_migrations |
+| `backend/src/db/db.ts` — migration system        | ✅ Complete | Version tracking with schema_migrations table                          |
+| `.gitignore` — database files added              | ✅ Complete | backend/data/ and \*.db excluded                                       |
+| `backend/src/repositories/` directory created    | ✅ Complete |                                                                        |
+| `LeadRepository` — CRUD operations               | ✅ Complete | Write-through pattern with quality tier support                        |
+| `JobRepository` — CRUD operations                | ✅ Complete | Job lifecycle management with status tracking                          |
+| `DedupRepository` — rolling window + TTL cleanup | ✅ Complete | 15-day rolling window with automatic cleanup                           |
+| Repository unit tests                            | ⬜ Pending  | Phase 2-5 (deferred - can add later)                                   |
+| `store.ts` — repository integration              | ✅ Complete | Full write-through cache pattern implemented                           |
+| In-memory leads[] as write-through cache         | ✅ Complete | Fast SSE access, persistent DB storage                                 |
+| Replace in-memory dedupSet with DedupRepository  | ✅ Complete | Cross-run deduplication now persists                                   |
+| Scheduled dedup cleanup task                     | ✅ Complete | Runs every 24h (1min in test mode)                                     |
+| `store.reset()` — cache-only clear               | ✅ Complete | DB data persists across job runs                                       |
+| GET /api/jobs — job history with pagination      | ✅ Complete | Supports status filter, limit/offset pagination                        |
+| GET /api/jobs/:id — job details                  | ✅ Complete | Returns job context + stats                                            |
+| GET /api/jobs/:id/leads — job-specific export    | ✅ Complete | Paginated lead retrieval by job                                        |
+| DELETE /api/jobs/:id — archive jobs              | ✅ Complete | Cascades to leads and failure metrics                                  |
+| Register jobs router in index.ts                 | ✅ Complete | Scheduler started on server boot                                       |
+| /api/export — job_id filter support              | ⬜ Pending  | Phase 4-5 (frontend integration needed)                                |
+| Frontend Job History page                        | ⬜ Pending  | Phase 5-1                                                              |
+| Frontend Export from Job feature                 | ⬜ Pending  | Phase 5-2                                                              |
+| Dashboard — persistent stats across restarts     | ⬜ Pending  | Phase 5-3                                                              |
+| End-to-end testing                               | ⬜ Pending  | Phase 6-1                                                              |
+| Performance benchmarks                           | ⬜ Pending  | Phase 6-2                                                              |
+
+**Schema Design:**
+
+- `jobs` — job metadata (jobId, keyword, location, status, lead count, timestamps)
+- `leads` — business records tied to jobs (businessName, email, phone, website, quality tier)
+
+**Implementation Strategy:**
+
+Write-through cache pattern: in-memory leads[] kept for fast SSE access, DB for persistence. Deduplication moved from in-memory Map to SQLite table with scheduled cleanup.  
 **TTL:** `DEDUP_WINDOW_DAYS` env var (default 15 days)
+
+**Backend Status:** ✅ Complete and ready for testing  
+**Frontend Status:** ⬜ Pending (Phase 5)
 
 ---
 

@@ -1,16 +1,16 @@
 /**
  * store.ts
- * In-memory session store for the Lead Generation Scraper.
+ * In-memory session store with SQLite persistence for the Lead Generation Scraper.
  *
- * CONSTRAINTS (from docs/CONSTRAINTS.md):
- * - All data lives in Node.js process memory ONLY.
- * - No database writes, no file writes, no external caching.
- * - store.reset() clears ALL data — called at the start of every new job.
- * - Data is lost on server restart. Operator must export before restarting.
- * - The dedup Set is scoped to a single job run and cleared on reset().
+ * ARCHITECTURE (Phase 21 - Database Integration):
+ * - Write-through cache pattern: in-memory leads[] for fast SSE access, DB for persistence
+ * - Deduplication now uses persistent SQLite with 15-day rolling window
+ * - Job metadata persisted to database for history tracking
+ * - store.reset() clears in-memory cache only (DB data persists)
+ * - Data survives server restarts (previous limitation fixed)
  */
 
-import { v4 as uuidv4 } from 'uuid';
+import { v4 as uuidv4 } from "uuid";
 import {
   FailureMetrics,
   JobContext,
@@ -19,17 +19,20 @@ import {
   ScrapeDepth,
   ContactFilter,
   StoreStats,
-} from './types';
+} from "./types";
+import { LeadRepository } from "./repositories/LeadRepository";
+import { JobRepository } from "./repositories/JobRepository";
+import { DedupRepository } from "./repositories/DedupRepository";
 
 // ─── Private State ────────────────────────────────────────────────────────────
 
+/** In-memory leads cache for fast SSE access (write-through to DB). */
 let leads: Lead[] = [];
 let discardCount = 0;
-let jobStatus: JobStatus = 'idle';
+let jobStatus: JobStatus = "idle";
 let jobContext: JobContext | null = null;
 
-/** In-memory dedup Set. Key format: `${normalizedPhone}|${rootDomain}` (tldts). */
-let dedupSet = new Set<string>();
+/** Deduplication now uses persistent SQLite - no in-memory Set needed. */
 
 let failureMetrics: FailureMetrics = {
   discard_no_contact: 0,
@@ -49,16 +52,15 @@ let failureMetrics: FailureMetrics = {
 
 export const store = {
   /**
-   * Resets ALL session state.
+   * Resets in-memory cache only.
+   * Database data persists across job runs.
    * Must be called at the start of every new job.
-   * Previous session's leads are permanently lost after this call.
    */
   reset(): void {
     leads = [];
     discardCount = 0;
-    jobStatus = 'idle';
+    jobStatus = "idle";
     jobContext = null;
-    dedupSet = new Set<string>();
     failureMetrics = {
       discard_no_contact: 0,
       website_unreachable: 0,
@@ -78,14 +80,15 @@ export const store = {
    * Initialises a new job context.
    * Generates a UUID jobId and stores keyword, location, depth, ISO country code,
    * contact filter mode, and maxLeads target.
+   * Also creates a persistent job record in the database.
    */
   initJob(
     keyword: string,
     location: string,
     depth: ScrapeDepth,
     isoCountryCode: string,
-    contactFilter: ContactFilter = 'any',
-    maxLeads = 100
+    contactFilter: ContactFilter = "any",
+    maxLeads = 100,
   ): JobContext {
     const ctx: JobContext = {
       jobId: uuidv4(),
@@ -97,14 +100,27 @@ export const store = {
       maxLeads,
     };
     jobContext = ctx;
+
+    // Create persistent job record in database
+    JobRepository.create(ctx);
+
     return ctx;
   },
 
   // ─── Lead Management ────────────────────────────────────────────────────────
 
-  /** Appends a qualifying lead to the in-memory array. */
+  /**
+   * Appends a qualifying lead to the in-memory cache AND database.
+   * Write-through pattern: fast in-memory access for SSE, persistent DB for history.
+   */
   addLead(lead: Lead): void {
+    // Add to in-memory cache for fast SSE access
     leads.push(lead);
+
+    // Persist to database if we have an active job
+    if (jobContext) {
+      LeadRepository.create(lead, jobContext.jobId, lead._qualityTier);
+    }
   },
 
   /** Increments the discard counter (lead had no email AND no phone). */
@@ -125,18 +141,16 @@ export const store = {
   // ─── Deduplication ──────────────────────────────────────────────────────────
 
   /**
-   * Checks whether a dedup key has been seen in this job run.
+   * Checks whether a dedup key has been seen within the 15-day rolling window.
    * Key format: `${normalizedPhone}|${rootDomain}` (tldts).
    * Returns true if duplicate (should be skipped), false if new.
+   * Uses persistent SQLite storage - survives server restarts.
    *
    * CONSTRAINT: If both normalizedPhone and rootDomain are empty,
    * the entry passes through without deduplication (no key can be formed).
    */
   isDuplicate(key: string): boolean {
-    if (!key || key === '|') return false; // no key — cannot dedup
-    if (dedupSet.has(key)) return true;
-    dedupSet.add(key);
-    return false;
+    return DedupRepository.isDuplicate(key);
   },
 
   // ─── Failure Metrics ────────────────────────────────────────────────────────
@@ -153,9 +167,27 @@ export const store = {
 
   // ─── Job Status ─────────────────────────────────────────────────────────────
 
-  /** Updates the current job status. */
+  /**
+   * Updates the current job status in memory and database.
+   */
   setStatus(status: JobStatus): void {
     jobStatus = status;
+
+    // Update persistent job record if we have an active job
+    if (jobContext) {
+      JobRepository.updateStatus(jobContext.jobId, status);
+
+      // Update lead/discard counts in database when job completes
+      if (status === "completed" || status === "stopped") {
+        JobRepository.markCompleted(
+          jobContext.jobId,
+          leads.length,
+          discardCount,
+        );
+      } else if (status === "error") {
+        JobRepository.markError(jobContext.jobId);
+      }
+    }
   },
 
   /** Returns the current job status. */

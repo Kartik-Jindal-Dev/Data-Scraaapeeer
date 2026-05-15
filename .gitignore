@@ -53,3 +53,7 @@ Thumbs.db
 .cache/
 tmp/
 temp/
+
+# ─── Database ────────────────────────────────────────────────────────────────
+backend/data/
+backend/data/*.db
