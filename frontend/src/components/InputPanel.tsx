@@ -1,12 +1,18 @@
-'use client';
+"use client";
 
-import { useState, useEffect, useRef, KeyboardEvent } from 'react';
-import { ContactFilter, ScrapeDepth, PROFESSION_LABELS } from '../types';
+import { useState, useEffect, useRef, KeyboardEvent } from "react";
+import { ContactFilter, ScrapeDepth, PROFESSION_LABELS } from "../types";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8080";
+const API_BASE = process.env.NEXT_PUBLIC_API_URL! ?? "http://localhost:8080";
 
-interface CountryOption { name: string; isoCode: string; }
-interface StateOption   { name: string; isoCode: string; }
+interface CountryOption {
+  name: string;
+  isoCode: string;
+}
+interface StateOption {
+  name: string;
+  isoCode: string;
+}
 
 // ─── Props ────────────────────────────────────────────────────────────────────
 
@@ -63,7 +69,7 @@ export default function InputPanel({
 
   // ── State dropdown open/close ─────────────────────────────────────────────
   const [stateDropdownOpen, setStateDropdownOpen] = useState(false);
-  const [stateSearch, setStateSearch] = useState('');
+  const [stateSearch, setStateSearch] = useState("");
   const stateDropdownRef = useRef<HTMLDivElement>(null);
 
   // ── Load countries on mount ───────────────────────────────────────────────
@@ -72,7 +78,9 @@ export default function InputPanel({
     fetch(`${API_BASE}/api/locations/countries`)
       .then((r) => r.json())
       .then((data: CountryOption[]) => setCountries(data))
-      .catch(() => {/* silently fail — user can still type */})
+      .catch(() => {
+        /* silently fail — user can still type */
+      })
       .finally(() => setCountriesLoading(false));
   }, []);
 
@@ -86,23 +94,28 @@ export default function InputPanel({
     setStatesLoading(true);
     setAvailableStates([]);
     onStatesChange([]);
-    fetch(`${API_BASE}/api/locations/states?country=${encodeURIComponent(country)}`)
+    fetch(
+      `${API_BASE}/api/locations/states?country=${encodeURIComponent(country)}`,
+    )
       .then((r) => r.json())
       .then((data: StateOption[]) => setAvailableStates(data))
       .catch(() => {})
       .finally(() => setStatesLoading(false));
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [country]);
 
   // ── Close state dropdown on outside click ─────────────────────────────────
   useEffect(() => {
     function handleClick(e: MouseEvent) {
-      if (stateDropdownRef.current && !stateDropdownRef.current.contains(e.target as Node)) {
+      if (
+        stateDropdownRef.current &&
+        !stateDropdownRef.current.contains(e.target as Node)
+      ) {
         setStateDropdownOpen(false);
       }
     }
-    document.addEventListener('mousedown', handleClick);
-    return () => document.removeEventListener('mousedown', handleClick);
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
   }, []);
 
   // ── State toggle ──────────────────────────────────────────────────────────
@@ -124,17 +137,20 @@ export default function InputPanel({
 
   // ── Filtered states for search ────────────────────────────────────────────
   const filteredStates = availableStates.filter((s) =>
-    s.name.toLowerCase().includes(stateSearch.toLowerCase())
+    s.name.toLowerCase().includes(stateSearch.toLowerCase()),
   );
 
-  const canStart = profession.trim().length > 0 && country.length > 0 && states.length > 0;
+  const canStart =
+    profession.trim().length > 0 && country.length > 0 && states.length > 0;
 
   return (
     <div className="bg-white border border-gray-200 rounded-lg p-5 space-y-4">
-
       {/* ── Keyword / Profession ─────────────────────────────────────────── */}
       <div>
-        <label htmlFor="profession" className="block text-sm font-medium text-gray-700 mb-1">
+        <label
+          htmlFor="profession"
+          className="block text-sm font-medium text-gray-700 mb-1"
+        >
           Keyword / Profession
         </label>
         <datalist id="profession-suggestions">
@@ -155,28 +171,34 @@ export default function InputPanel({
           aria-label="Keyword or profession"
         />
         <p className="mt-1 text-xs text-gray-400">
-          Type any keyword or pick a suggestion. 1 keyword per run — cities expand automatically.
+          Type any keyword or pick a suggestion. 1 keyword per run — cities
+          expand automatically.
         </p>
       </div>
 
       {/* ── Country dropdown ─────────────────────────────────────────────── */}
       <div>
-        <label htmlFor="country-select" className="block text-sm font-medium text-gray-700 mb-1">
+        <label
+          htmlFor="country-select"
+          className="block text-sm font-medium text-gray-700 mb-1"
+        >
           Country
         </label>
         <select
           id="country-select"
           value={country}
           onChange={(e) => {
-            const selected = countries.find((c) => c.isoCode === e.target.value);
-            onCountryChange(e.target.value, selected?.name ?? '');
+            const selected = countries.find(
+              (c) => c.isoCode === e.target.value,
+            );
+            onCountryChange(e.target.value, selected?.name ?? "");
           }}
           disabled={isRunning || countriesLoading}
           className="w-full border border-gray-300 rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100 disabled:cursor-not-allowed"
           aria-label="Select country"
         >
           <option value="">
-            {countriesLoading ? 'Loading countries…' : '— Select a country —'}
+            {countriesLoading ? "Loading countries…" : "— Select a country —"}
           </option>
           {countries.map((c) => (
             <option key={c.isoCode} value={c.isoCode}>
@@ -191,18 +213,24 @@ export default function InputPanel({
         <label className="block text-sm font-medium text-gray-700 mb-1">
           States / Regions
           <span className="ml-1 text-xs text-gray-400 font-normal">
-            ({states.length} selected{availableStates.length > 0 ? ` of ${availableStates.length}` : ''})
+            ({states.length} selected
+            {availableStates.length > 0 ? ` of ${availableStates.length}` : ""})
           </span>
         </label>
 
         {/* Selected state chips */}
         {states.length > 0 && (
-          <div className="flex flex-wrap gap-1.5 mb-2" aria-label="Selected states">
+          <div
+            className="flex flex-wrap gap-1.5 mb-2"
+            aria-label="Selected states"
+          >
             {states.map((s) => (
               <span
                 key={s}
                 className={`inline-flex items-center gap-1 px-2 py-0.5 text-xs rounded-full ${
-                  locationError ? 'bg-red-100 text-red-800' : 'bg-green-100 text-green-800'
+                  locationError
+                    ? "bg-red-100 text-red-800"
+                    : "bg-green-100 text-green-800"
                 }`}
               >
                 {s}
@@ -225,7 +253,9 @@ export default function InputPanel({
         <div className="relative" ref={stateDropdownRef}>
           <button
             type="button"
-            onClick={() => !isRunning && country && setStateDropdownOpen((o) => !o)}
+            onClick={() =>
+              !isRunning && country && setStateDropdownOpen((o) => !o)
+            }
             disabled={isRunning || !country || statesLoading}
             className="w-full flex items-center justify-between border border-gray-300 rounded px-3 py-2 text-sm text-left bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100 disabled:cursor-not-allowed"
             aria-haspopup="listbox"
@@ -233,14 +263,16 @@ export default function InputPanel({
           >
             <span className="text-gray-500">
               {statesLoading
-                ? 'Loading states…'
+                ? "Loading states…"
                 : !country
-                ? 'Select a country first'
-                : states.length === 0
-                ? 'Select states / regions…'
-                : `${states.length} state${states.length !== 1 ? 's' : ''} selected`}
+                  ? "Select a country first"
+                  : states.length === 0
+                    ? "Select states / regions…"
+                    : `${states.length} state${states.length !== 1 ? "s" : ""} selected`}
             </span>
-            <span className="text-gray-400 ml-2">{stateDropdownOpen ? '▲' : '▼'}</span>
+            <span className="text-gray-400 ml-2">
+              {stateDropdownOpen ? "▲" : "▼"}
+            </span>
           </button>
 
           {/* Dropdown panel */}
@@ -284,7 +316,9 @@ export default function InputPanel({
                 aria-label="States"
               >
                 {filteredStates.length === 0 ? (
-                  <li className="px-3 py-2 text-xs text-gray-400">No states match</li>
+                  <li className="px-3 py-2 text-xs text-gray-400">
+                    No states match
+                  </li>
                 ) : (
                   filteredStates.map((s) => {
                     const checked = states.includes(s.name);
@@ -295,7 +329,7 @@ export default function InputPanel({
                         aria-selected={checked}
                         onClick={() => toggleState(s.name)}
                         className={`flex items-center gap-2 px-3 py-1.5 text-sm cursor-pointer hover:bg-blue-50 ${
-                          checked ? 'bg-blue-50 text-blue-800' : 'text-gray-700'
+                          checked ? "bg-blue-50 text-blue-800" : "text-gray-700"
                         }`}
                       >
                         <input
@@ -328,18 +362,26 @@ export default function InputPanel({
         </div>
 
         {locationError && (
-          <p id="location-error" role="alert" className="mt-1 text-xs text-red-600">
+          <p
+            id="location-error"
+            role="alert"
+            className="mt-1 text-xs text-red-600"
+          >
             {locationError}
           </p>
         )}
         <p className="mt-1 text-xs text-gray-400">
-          Cities are fetched automatically per state. All cities are tried before giving up.
+          Cities are fetched automatically per state. All cities are tried
+          before giving up.
         </p>
       </div>
 
       {/* ── Max Leads ────────────────────────────────────────────────────── */}
       <div>
-        <label htmlFor="maxLeads" className="block text-sm font-medium text-gray-700 mb-1">
+        <label
+          htmlFor="maxLeads"
+          className="block text-sm font-medium text-gray-700 mb-1"
+        >
           Max Leads
         </label>
         <input
@@ -363,9 +405,15 @@ export default function InputPanel({
 
       {/* ── Depth toggle ─────────────────────────────────────────────────── */}
       <div>
-        <span className="block text-sm font-medium text-gray-700 mb-2">Depth</span>
-        <div className="flex gap-4" role="radiogroup" aria-label="Scraping depth">
-          {(['homepage', 'indepth'] as ScrapeDepth[]).map((d) => (
+        <span className="block text-sm font-medium text-gray-700 mb-2">
+          Depth
+        </span>
+        <div
+          className="flex gap-4"
+          role="radiogroup"
+          aria-label="Scraping depth"
+        >
+          {(["homepage", "indepth"] as ScrapeDepth[]).map((d) => (
             <label key={d} className="flex items-center gap-2 cursor-pointer">
               <input
                 type="radio"
@@ -377,7 +425,7 @@ export default function InputPanel({
                 className="accent-blue-600"
               />
               <span className="text-sm text-gray-700">
-                {d === 'homepage' ? 'Homepage only' : 'In-depth'}
+                {d === "homepage" ? "Homepage only" : "In-depth"}
               </span>
             </label>
           ))}
@@ -386,17 +434,26 @@ export default function InputPanel({
 
       {/* ── Contact filter ────────────────────────────────────────────────── */}
       <div>
-        <span className="block text-sm font-medium text-gray-700 mb-2">Keep leads with</span>
-        <div className="flex flex-wrap gap-4" role="radiogroup" aria-label="Contact filter">
+        <span className="block text-sm font-medium text-gray-700 mb-2">
+          Keep leads with
+        </span>
+        <div
+          className="flex flex-wrap gap-4"
+          role="radiogroup"
+          aria-label="Contact filter"
+        >
           {(
             [
-              { value: 'any',        label: 'Email or Phone' },
-              { value: 'email_only', label: 'Email only' },
-              { value: 'phone_only', label: 'Phone only' },
-              { value: 'both',       label: 'Both' },
+              { value: "any", label: "Email or Phone" },
+              { value: "email_only", label: "Email only" },
+              { value: "phone_only", label: "Phone only" },
+              { value: "both", label: "Both" },
             ] as { value: ContactFilter; label: string }[]
           ).map(({ value, label }) => (
-            <label key={value} className="flex items-center gap-2 cursor-pointer">
+            <label
+              key={value}
+              className="flex items-center gap-2 cursor-pointer"
+            >
               <input
                 type="radio"
                 name="contactFilter"
@@ -415,7 +472,9 @@ export default function InputPanel({
 
       {/* ── Discovery source toggle ───────────────────────────────────── */}
       <div>
-        <span className="block text-sm font-medium text-gray-700 mb-2">Discovery source</span>
+        <span className="block text-sm font-medium text-gray-700 mb-2">
+          Discovery source
+        </span>
         <div className="flex items-center gap-3">
           <button
             type="button"
@@ -424,24 +483,24 @@ export default function InputPanel({
             onClick={() => !isRunning && onUseSerperChange(!useSerper)}
             disabled={isRunning}
             className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-1 disabled:cursor-not-allowed ${
-              useSerper ? 'bg-blue-600' : 'bg-gray-300'
+              useSerper ? "bg-blue-600" : "bg-gray-300"
             }`}
             aria-label="Toggle Serper API"
           >
             <span
               className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${
-                useSerper ? 'translate-x-6' : 'translate-x-1'
+                useSerper ? "translate-x-6" : "translate-x-1"
               }`}
             />
           </button>
           <div>
             <span className="text-sm font-medium text-gray-700">
-              {useSerper ? 'Serper API' : 'Google Maps'}
+              {useSerper ? "Serper API" : "Google Maps"}
             </span>
             <p className="text-xs text-gray-400">
               {useSerper
-                ? 'Fast (~2s/city) — uses paid Serper API key'
-                : 'Free but slow (~20s/city) — Playwright scrapes Google Maps'}
+                ? "Fast (~2s/city) — uses paid Serper API key"
+                : "Free but slow (~20s/city) — Playwright scrapes Google Maps"}
             </p>
           </div>
         </div>

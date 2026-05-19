@@ -44,12 +44,7 @@ app.set("trust proxy", 1);
 
 app.use(
   cors({
-    origin: [
-      process.env.FRONTEND_URL || "http://localhost:3000",
-      "http://localhost:3000",
-    ],
-    methods: ["GET", "POST"],
-    allowedHeaders: ["Content-Type"],
+    origin: ["http://localhost:3000", process.env.FRONTEND_URL!],
     credentials: true,
   }),
 );
