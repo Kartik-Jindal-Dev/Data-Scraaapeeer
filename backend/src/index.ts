@@ -34,7 +34,7 @@ import { startScheduler } from "./scheduler";
 // ─── App Setup ────────────────────────────────────────────────────────────────
 
 const app = express();
-const PORT = parseInt(process.env.PORT ?? "4000", 10);
+const PORT = parseInt(process.env.PORT ?? "8080", 10);
 
 // Trust first proxy hop for correct IP detection behind nginx/load balancer
 // Required for express-rate-limit to use the real client IP
@@ -44,9 +44,13 @@ app.set("trust proxy", 1);
 
 app.use(
   cors({
-    origin: process.env.FRONTEND_URL ?? "http://localhost:3000",
+    origin: [
+      process.env.FRONTEND_URL || "http://localhost:3000",
+      "http://localhost:3000",
+    ],
     methods: ["GET", "POST"],
     allowedHeaders: ["Content-Type"],
+    credentials: true,
   }),
 );
 
@@ -94,7 +98,7 @@ app.use(
 
 // ─── Start Server ─────────────────────────────────────────────────────────────
 
-const server = app.listen(PORT, () => {
+const server = app.listen(PORT, "0.0.0.0", () => {
   logger.info(`Lead Scraper backend running on port ${PORT}`);
   logger.info(`Environment: ${process.env.NODE_ENV ?? "development"}`);
 
