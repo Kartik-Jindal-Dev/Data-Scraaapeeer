@@ -31,17 +31,17 @@
  * - The old path is never removed until Phase 8 rollout is confirmed stable.
  */
 
-import { Request, Response, Router } from 'express';
-import { logger } from '../logger';
-import { store } from '../store';
-import { ContactFilter, JobContext, ScrapeDepth } from '../types';
-import { geocodeLocation } from '../pipeline/geocoder';
-import { resolveCountryIso, getFullRankedCities } from '../pipeline/cityPool';
-import { isCityVisited, markCityVisited } from '../pipeline/visitedCities';
-import { runPipeline, resetStopSignal, stopSignal } from '../pipeline/pipeline';
-import { createStateScheduler } from '../pipeline/stateScheduler';
-import { emitStatus, closeSSEConnection } from '../sse';
-import { startRateLimiter } from '../middleware/rateLimiter';
+import { Request, Response, Router } from "express";
+import { logger } from "../logger";
+import { store } from "../store";
+import { ContactFilter, JobContext, ScrapeDepth } from "../types";
+import { geocodeLocation } from "../pipeline/geocoder";
+import { resolveCountryIso, getFullRankedCities } from "../pipeline/cityPool";
+import { isCityVisited, markCityVisited } from "../pipeline/visitedCities";
+import { runPipeline, resetStopSignal, stopSignal } from "../pipeline/pipeline";
+import { createStateScheduler } from "../pipeline/stateScheduler";
+import { emitStatus, closeSSEConnection } from "../sse";
+import { startRateLimiter } from "../middleware/rateLimiter";
 
 export const startRouter = Router();
 
@@ -50,7 +50,7 @@ startRouter.use(startRateLimiter);
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-const DEFAULT_MAX_LEADS = parseInt(process.env.MAX_LEADS ?? '100', 10);
+const DEFAULT_MAX_LEADS = parseInt(process.env.MAX_LEADS ?? "100", 10);
 
 // NOTE: CITY_BATCH_SIZE, INTER_JOB_DELAY_MS, PARALLEL_CITIES_ENABLED,
 // PARALLEL_CITIES_MAX, and CITY_ROUND_ROBIN_ENABLED are read inside the
@@ -92,28 +92,43 @@ interface ValidatedInput {
   depth: ScrapeDepth;
   contactFilter: ContactFilter;
   maxLeads: number;
-  mode: 'city_batched' | 'legacy';
+  mode: "city_batched" | "legacy";
   useSerper: boolean;
 }
 
 function validateStartBody(
-  body: StartRequestBody
-): { valid: true } & ValidatedInput | { valid: false; error: string } {
-  const { keyword, country, states, location, locations, depth, contactFilter, maxLeads, useSerper } = body;
+  body: StartRequestBody,
+): ({ valid: true } & ValidatedInput) | { valid: false; error: string } {
+  const {
+    keyword,
+    country,
+    states,
+    location,
+    locations,
+    depth,
+    contactFilter,
+    maxLeads,
+    useSerper,
+  } = body;
 
   // ── useSerper override ───────────────────────────────────────────────────
   // If provided by the frontend, overrides SERPER_ENABLED env var for this job.
   // If not provided, falls back to the env var setting.
-  const useSerperValue = typeof useSerper === 'boolean'
-    ? useSerper
-    : process.env.SERPER_ENABLED === 'true';
+  const useSerperValue =
+    typeof useSerper === "boolean"
+      ? useSerper
+      : process.env.SERPER_ENABLED === "true";
 
   // ── Keyword: exactly 1 ───────────────────────────────────────────────────
   let kw: string;
-  if (typeof keyword === 'string' && keyword.trim().length > 0) {
+  if (typeof keyword === "string" && keyword.trim().length > 0) {
     kw = keyword.trim();
   } else {
-    return { valid: false, error: 'keyword is required and must be a non-empty string. Exactly 1 keyword per run.' };
+    return {
+      valid: false,
+      error:
+        "keyword is required and must be a non-empty string. Exactly 1 keyword per run.",
+    };
   }
 
   // ── maxLeads ─────────────────────────────────────────────────────────────
@@ -121,40 +136,57 @@ function validateStartBody(
   if (maxLeads !== undefined) {
     const parsed = parseInt(String(maxLeads), 10);
     if (isNaN(parsed) || parsed < 1) {
-      return { valid: false, error: 'maxLeads must be a positive integer.' };
+      return { valid: false, error: "maxLeads must be a positive integer." };
     }
     maxLeadsValue = parsed;
   }
 
   // ── Depth ────────────────────────────────────────────────────────────────
-  const depthValue = depth ?? 'homepage';
-  if (depthValue !== 'homepage' && depthValue !== 'indepth') {
+  const depthValue = depth ?? "homepage";
+  if (depthValue !== "homepage" && depthValue !== "indepth") {
     return { valid: false, error: 'depth must be "homepage" or "indepth"' };
   }
 
   // ── Contact filter ────────────────────────────────────────────────────────
-  const validFilters: ContactFilter[] = ['any', 'email_only', 'phone_only', 'both'];
-  const filterValue = (contactFilter ?? 'any') as ContactFilter;
+  const validFilters: ContactFilter[] = [
+    "any",
+    "email_only",
+    "phone_only",
+    "both",
+  ];
+  const filterValue = (contactFilter ?? "any") as ContactFilter;
   if (!validFilters.includes(filterValue)) {
-    return { valid: false, error: 'contactFilter must be "any", "email_only", "phone_only", or "both"' };
+    return {
+      valid: false,
+      error:
+        'contactFilter must be "any", "email_only", "phone_only", or "both"',
+    };
   }
 
   // ── Mode: city_batched (country + states) vs legacy (location string) ────
   if (country !== undefined || states !== undefined) {
     // City-batched mode
-    if (typeof country !== 'string' || country.trim().length === 0) {
-      return { valid: false, error: 'country is required when using states-based city batching.' };
+    if (typeof country !== "string" || country.trim().length === 0) {
+      return {
+        valid: false,
+        error: "country is required when using states-based city batching.",
+      };
     }
     let statesArray: string[] = [];
     if (Array.isArray(states)) {
       statesArray = states
-        .filter((s): s is string => typeof s === 'string' && s.trim().length > 0)
+        .filter(
+          (s): s is string => typeof s === "string" && s.trim().length > 0,
+        )
         .map((s) => s.trim());
-    } else if (typeof states === 'string' && states.trim().length > 0) {
+    } else if (typeof states === "string" && states.trim().length > 0) {
       statesArray = [states.trim()];
     }
     if (statesArray.length === 0) {
-      return { valid: false, error: 'At least one state/region is required for city-batched mode.' };
+      return {
+        valid: false,
+        error: "At least one state/region is required for city-batched mode.",
+      };
     }
     return {
       valid: true,
@@ -165,7 +197,7 @@ function validateStartBody(
       depth: depthValue as ScrapeDepth,
       contactFilter: filterValue,
       maxLeads: maxLeadsValue,
-      mode: 'city_batched',
+      mode: "city_batched",
       useSerper: useSerperValue,
     };
   }
@@ -174,24 +206,34 @@ function validateStartBody(
   let locArray: string[];
   if (Array.isArray(locations)) {
     locArray = locations
-      .filter((l): l is string => typeof l === 'string' && l.trim().length > 0)
+      .filter((l): l is string => typeof l === "string" && l.trim().length > 0)
       .map((l) => l.trim());
-  } else if (typeof location === 'string' && location.trim().length > 0) {
+  } else if (typeof location === "string" && location.trim().length > 0) {
     locArray = [location.trim()];
-  } else if (typeof locations === 'string' && (locations as string).trim().length > 0) {
+  } else if (
+    typeof locations === "string" &&
+    (locations as string).trim().length > 0
+  ) {
     locArray = [(locations as string).trim()];
   } else {
     return {
       valid: false,
-      error: 'Provide either (country + states[]) for city-batched mode, or location/locations for single-location mode.',
+      error:
+        "Provide either (country + states[]) for city-batched mode, or location/locations for single-location mode.",
     };
   }
 
   if (locArray.length === 0) {
-    return { valid: false, error: 'At least one non-empty location is required.' };
+    return {
+      valid: false,
+      error: "At least one non-empty location is required.",
+    };
   }
   if (locArray.length > 20) {
-    return { valid: false, error: 'Maximum 20 locations allowed in legacy mode.' };
+    return {
+      valid: false,
+      error: "Maximum 20 locations allowed in legacy mode.",
+    };
   }
 
   return {
@@ -203,7 +245,7 @@ function validateStartBody(
     depth: depthValue as ScrapeDepth,
     contactFilter: filterValue,
     maxLeads: maxLeadsValue,
-    mode: 'legacy',
+    mode: "legacy",
     useSerper: useSerperValue,
   };
 }
@@ -216,41 +258,60 @@ function sleep(ms: number): Promise<void> {
 
 // ─── Route Handler ────────────────────────────────────────────────────────────
 
-startRouter.post('/', async (req: Request, res: Response): Promise<void> => {
+startRouter.post("/", async (req: Request, res: Response): Promise<void> => {
   // Reject if a job is already running
-  if (store.getStatus() === 'running') {
-    res.status(409).json({
-      error: 'job_already_running',
-      message: 'A job is already running. Stop it before starting a new one.',
-    });
-    return;
-  }
+  // if (store.getStatus() === 'running') {
+  //   res.status(409).json({
+  //     error: 'job_already_running',
+  //     message: 'A job is already running. Stop it before starting a new one.',
+  //   });
+  //   return;
+  // }
 
   // ── Per-request config (read here so test env overrides take effect) ───────
-  const CITY_BATCH_SIZE = parseInt(process.env.CITY_BATCH_SIZE ?? '5', 10);
-  const INTER_JOB_DELAY_MS = parseInt(process.env.INTER_JOB_DELAY_MS ?? '0', 10);
+  const CITY_BATCH_SIZE = parseInt(process.env.CITY_BATCH_SIZE ?? "5", 10);
+  const INTER_JOB_DELAY_MS = parseInt(
+    process.env.INTER_JOB_DELAY_MS ?? "0",
+    10,
+  );
   // Phase 5.1: parallel city execution
-  const PARALLEL_CITIES_ENABLED = process.env.PARALLEL_CITIES_ENABLED === 'true';
+  const PARALLEL_CITIES_ENABLED =
+    process.env.PARALLEL_CITIES_ENABLED === "true";
   const PARALLEL_CITIES_MAX = Math.min(
-    Math.max(1, parseInt(process.env.PARALLEL_CITIES_MAX ?? '2', 10)),
-    4 // hard cap: 4 concurrent city jobs max to avoid browser/memory saturation
+    Math.max(1, parseInt(process.env.PARALLEL_CITIES_MAX ?? "2", 10)),
+    4, // hard cap: 4 concurrent city jobs max to avoid browser/memory saturation
   );
   // Round-Robin Scheduler feature flag
-  const CITY_ROUND_ROBIN_ENABLED = process.env.CITY_ROUND_ROBIN_ENABLED === 'true';
+  const CITY_ROUND_ROBIN_ENABLED =
+    process.env.CITY_ROUND_ROBIN_ENABLED === "true";
 
   // Validate request body
   const validation = validateStartBody(req.body as StartRequestBody);
   if (!validation.valid) {
-    res.status(400).json({ error: 'invalid_request', message: validation.error });
+    res
+      .status(400)
+      .json({ error: "invalid_request", message: validation.error });
     return;
   }
 
-  const { keyword, country, states, locations, depth, contactFilter, maxLeads, mode, useSerper } = validation;
+  const {
+    keyword,
+    country,
+    states,
+    locations,
+    depth,
+    contactFilter,
+    maxLeads,
+    mode,
+    useSerper,
+  } = validation;
 
   // Override SERPER_ENABLED for this job based on the frontend toggle.
   // This is a per-request override — it does not persist across jobs.
-  process.env.SERPER_ENABLED = useSerper ? 'true' : 'false';
-  logger.info(`Discovery mode: ${useSerper ? 'Serper API' : 'Google Maps (Playwright)'}`);
+  process.env.SERPER_ENABLED = useSerper ? "true" : "false";
+  logger.info(
+    `Discovery mode: ${useSerper ? "Serper API" : "Google Maps (Playwright)"}`,
+  );
 
   // Reset store — clears all previous session data
   store.reset();
@@ -258,21 +319,28 @@ startRouter.post('/', async (req: Request, res: Response): Promise<void> => {
 
   logger.info(
     `Job starting: keyword="${keyword}" mode=${mode} ` +
-    (mode === 'city_batched'
-      ? `country="${country}" states=${JSON.stringify(states)}`
-      : `locations=${JSON.stringify(locations)}`) +
-    ` depth="${depth}" contactFilter="${contactFilter}" maxLeads=${maxLeads}`
+      (mode === "city_batched"
+        ? `country="${country}" states=${JSON.stringify(states)}`
+        : `locations=${JSON.stringify(locations)}`) +
+      ` depth="${depth}" contactFilter="${contactFilter}" maxLeads=${maxLeads}`,
   );
 
   // ── City-batched mode (Phase 14) ───────────────────────────────────────────
-  if (mode === 'city_batched') {
+  if (mode === "city_batched") {
     // Resolve ISO code directly from country-state-city — no Nominatim needed
     const isoCountryCode = resolveCountryIso(country!);
     logger.info(`Country resolved: "${country}" → ISO=${isoCountryCode}`);
 
     // Initialise job context
-    const ctx = store.initJob(keyword, `${country}`, depth, isoCountryCode, contactFilter, maxLeads);
-    store.setStatus('running');
+    const ctx = store.initJob(
+      keyword,
+      `${country}`,
+      depth,
+      isoCountryCode,
+      contactFilter,
+      maxLeads,
+    );
+    store.setStatus("running");
     logger.info(`Job initialised (city_batched): jobId=${ctx.jobId}`);
     res.status(202).json({ jobId: ctx.jobId });
 
@@ -305,13 +373,22 @@ startRouter.post('/', async (req: Request, res: Response): Promise<void> => {
           rankedCities: getFullRankedCities(isoCountryCode, stateName),
         }));
 
-        const totalCities = perStateCities.reduce((sum, s) => sum + s.rankedCities.length, 0);
+        const totalCities = perStateCities.reduce(
+          (sum, s) => sum + s.rankedCities.length,
+          0,
+        );
 
         if (totalCities === 0) {
-          logger.warn(`City pool empty for country="${country}" states=${JSON.stringify(states)} — stopping`);
-          store.setStatus('completed');
+          logger.warn(
+            `City pool empty for country="${country}" states=${JSON.stringify(states)} — stopping`,
+          );
+          store.setStatus("completed");
           const stats = store.getStats();
-          emitStatus(ctx.jobId, { status: 'completed', leadCount: stats.leadCount, discardCount: stats.discardCount });
+          emitStatus(ctx.jobId, {
+            status: "completed",
+            leadCount: stats.leadCount,
+            discardCount: stats.discardCount,
+          });
           closeSSEConnection(ctx.jobId);
           return;
         }
@@ -324,7 +401,7 @@ startRouter.post('/', async (req: Request, res: Response): Promise<void> => {
 
         if (PARALLEL_CITIES_ENABLED) {
           logger.info(
-            `Parallel city execution enabled — max ${PARALLEL_CITIES_MAX} concurrent city jobs`
+            `Parallel city execution enabled — max ${PARALLEL_CITIES_MAX} concurrent city jobs`,
           );
         }
 
@@ -333,26 +410,33 @@ startRouter.post('/', async (req: Request, res: Response): Promise<void> => {
         let currentBatch = 0; // round number for round-robin; slice index for flattened
 
         // Phase 6: capture final round-robin progress from PATH A for final status emit
-        let finalRRProgress: import('../types').SseStatusPayload['roundRobinProgress'] | undefined;
+        let finalRRProgress:
+          | import("../types").SseStatusPayload["roundRobinProgress"]
+          | undefined;
 
         // ── Helper: dispatch one city job ───────────────────────────────────
         // Shared by both paths. Runs runPipeline(), marks city visited,
         // increments citiesProcessed. Returns immediately if stop/maxLeads hit.
         async function dispatchCity(
-          city: import('../types').CityEntry,
+          city: import("../types").CityEntry,
           batchNum: number,
         ): Promise<void> {
           if (stopSignal.stopped || store.getLeadCount() >= maxLeads) return;
           const locationStr = `${city.name}, ${city.state}`;
           const iterCtx: JobContext = {
-            jobId: ctx.jobId, keyword, location: locationStr,
-            depth, isoCountryCode, contactFilter, maxLeads,
+            jobId: ctx.jobId,
+            keyword,
+            location: locationStr,
+            depth,
+            isoCountryCode,
+            contactFilter,
+            maxLeads,
           };
           if (!stopSignal.stopped) resetStopSignal();
-          store.setStatus('running');
+          store.setStatus("running");
           logger.info(
             `Dispatching: "${locationStr}" (round/batch ${batchNum}/${totalBatches}, ` +
-            `city ${citiesProcessed + 1}/${totalCities})`
+              `city ${citiesProcessed + 1}/${totalCities})`,
           );
           await runPipeline(iterCtx, true);
           markCityVisited(keyword, city.name, isoCountryCode);
@@ -362,20 +446,25 @@ startRouter.post('/', async (req: Request, res: Response): Promise<void> => {
         // ── Helper: run a slice of cities (sequential or parallel) ──────────
         // Used by both paths to execute a set of cities for one round/batch.
         async function runCitySlice(
-          citiesToRun: import('../types').CityEntry[],
+          citiesToRun: import("../types").CityEntry[],
           batchNum: number,
-          roundRobinProgress?: import('../types').SseStatusPayload['roundRobinProgress'],
+          roundRobinProgress?: import("../types").SseStatusPayload["roundRobinProgress"],
         ): Promise<void> {
           if (citiesToRun.length === 0) return;
 
           const statsNow = store.getStats();
           emitStatus(ctx.jobId, {
-            status: 'running',
+            status: "running",
             leadCount: statsNow.leadCount,
             discardCount: statsNow.discardCount,
             activeKeyword: keyword,
-            activeLocation: citiesToRun.map((c) => c.name).join(', '),
-            batchProgress: { currentBatch: batchNum, totalBatches, citiesProcessed, totalCities },
+            activeLocation: citiesToRun.map((c) => c.name).join(", "),
+            batchProgress: {
+              currentBatch: batchNum,
+              totalBatches,
+              citiesProcessed,
+              totalCities,
+            },
             roundRobinProgress,
           });
 
@@ -385,8 +474,14 @@ startRouter.post('/', async (req: Request, res: Response): Promise<void> => {
             for (let p = 0; p < citiesToRun.length; p += PARALLEL_CITIES_MAX) {
               if (stopSignal.stopped || store.getLeadCount() >= maxLeads) break;
               const chunk = citiesToRun.slice(p, p + PARALLEL_CITIES_MAX);
-              await Promise.allSettled(chunk.map((city) => dispatchCity(city, batchNum)));
-              if (INTER_JOB_DELAY_MS > 0 && !stopSignal.stopped && store.getLeadCount() < maxLeads) {
+              await Promise.allSettled(
+                chunk.map((city) => dispatchCity(city, batchNum)),
+              );
+              if (
+                INTER_JOB_DELAY_MS > 0 &&
+                !stopSignal.stopped &&
+                store.getLeadCount() < maxLeads
+              ) {
                 logger.info(`Inter-job delay: ${INTER_JOB_DELAY_MS}ms`);
                 await sleep(INTER_JOB_DELAY_MS);
               }
@@ -396,7 +491,11 @@ startRouter.post('/', async (req: Request, res: Response): Promise<void> => {
             for (const city of citiesToRun) {
               if (stopSignal.stopped || store.getLeadCount() >= maxLeads) break;
               await dispatchCity(city, batchNum);
-              if (INTER_JOB_DELAY_MS > 0 && !stopSignal.stopped && store.getLeadCount() < maxLeads) {
+              if (
+                INTER_JOB_DELAY_MS > 0 &&
+                !stopSignal.stopped &&
+                store.getLeadCount() < maxLeads
+              ) {
                 logger.info(`Inter-job delay: ${INTER_JOB_DELAY_MS}ms`);
                 await sleep(INTER_JOB_DELAY_MS);
               }
@@ -410,7 +509,7 @@ startRouter.post('/', async (req: Request, res: Response): Promise<void> => {
         if (CITY_ROUND_ROBIN_ENABLED) {
           logger.info(
             `Round-robin scheduler ENABLED — ${states.length} selection(s), ` +
-            `batchSize=${CITY_BATCH_SIZE}, totalCities=${totalCities}`
+              `batchSize=${CITY_BATCH_SIZE}, totalCities=${totalCities}`,
           );
 
           const scheduler = createStateScheduler({
@@ -418,7 +517,8 @@ startRouter.post('/', async (req: Request, res: Response): Promise<void> => {
             batchSize: CITY_BATCH_SIZE,
             // isVisited is injected — scheduler never calls isCityVisited directly.
             // Evaluated lazily per city as the scheduler advances each cursor.
-            isVisited: (city) => isCityVisited(keyword, city.name, isoCountryCode),
+            isVisited: (city) =>
+              isCityVisited(keyword, city.name, isoCountryCode),
           });
 
           // ── Round loop — strictly sequential ───────────────────────────────
@@ -435,25 +535,29 @@ startRouter.post('/', async (req: Request, res: Response): Promise<void> => {
             // If cities IS non-empty, dispatch them even if allExhausted is true —
             // those are the last cities from selections that exhausted this round.
             if (round.allExhausted && round.cities.length === 0) {
-              logger.info(`Round-robin: all selections exhausted after round ${round.roundNumber - 1}`);
+              logger.info(
+                `Round-robin: all selections exhausted after round ${round.roundNumber - 1}`,
+              );
               break;
             }
 
             if (round.cities.length === 0) {
               // All cities in this round were visited — advance to next round
-              logger.info(`Round-robin: round ${round.roundNumber} — all cities visited, advancing`);
+              logger.info(
+                `Round-robin: round ${round.roundNumber} — all cities visited, advancing`,
+              );
               continue;
             }
 
             if (round.newlyExhausted.length > 0) {
               logger.info(
-                `Round-robin: round ${round.roundNumber} — selections exhausted: [${round.newlyExhausted.join(', ')}]`
+                `Round-robin: round ${round.roundNumber} — selections exhausted: [${round.newlyExhausted.join(", ")}]`,
               );
             }
 
             logger.info(
               `Round-robin: round ${round.roundNumber}/${totalBatches} — ` +
-              `${round.cities.length} cities: [${round.cities.map((sc) => sc.city.name).join(', ')}]`
+                `${round.cities.length} cities: [${round.cities.map((sc) => sc.city.name).join(", ")}]`,
             );
 
             // Extract plain CityEntry array for runCitySlice
@@ -461,23 +565,27 @@ startRouter.post('/', async (req: Request, res: Response): Promise<void> => {
 
             // Build roundRobinProgress from scheduler snapshot for SSE
             const snap = scheduler.snapshot();
-            const rrProgress: import('../types').SseStatusPayload['roundRobinProgress'] = {
-              currentRound: round.roundNumber,
-              selections: snap.selections.map((s) => ({
-                name: s.name,
-                citiesYielded: s.citiesYielded,
-                totalCities: s.totalCities,
-                exhausted: s.exhausted,
-              })),
-            };
+            const rrProgress: import("../types").SseStatusPayload["roundRobinProgress"] =
+              {
+                currentRound: round.roundNumber,
+                selections: snap.selections.map((s) => ({
+                  name: s.name,
+                  citiesYielded: s.citiesYielded,
+                  totalCities: s.totalCities,
+                  exhausted: s.exhausted,
+                })),
+              };
 
             await runCitySlice(citiesToRun, round.roundNumber, rrProgress);
 
-            if (stopSignal.stopped || store.getLeadCount() >= maxLeads) break roundLoop;
+            if (stopSignal.stopped || store.getLeadCount() >= maxLeads)
+              break roundLoop;
 
             // After dispatching, check if all selections are now exhausted
             if (round.allExhausted) {
-              logger.info(`Round-robin: all selections exhausted after round ${round.roundNumber}`);
+              logger.info(
+                `Round-robin: all selections exhausted after round ${round.roundNumber}`,
+              );
               break;
             }
           }
@@ -494,17 +602,17 @@ startRouter.post('/', async (req: Request, res: Response): Promise<void> => {
             })),
           };
 
-        // ══════════════════════════════════════════════════════════════════════
-        // PATH B — Flattened Batching (CITY_ROUND_ROBIN_ENABLED=false, default)
-        // ══════════════════════════════════════════════════════════════════════
+          // ══════════════════════════════════════════════════════════════════════
+          // PATH B — Flattened Batching (CITY_ROUND_ROBIN_ENABLED=false, default)
+          // ══════════════════════════════════════════════════════════════════════
         } else {
           logger.info(
             `Flattened city batching — ${totalCities} cities across ${states.length} state(s) ` +
-            `(${totalBatches} batches)`
+              `(${totalBatches} batches)`,
           );
 
           // Flatten all per-state city lists into one ordered array
-          const fullCityList: import('../types').CityEntry[] = [];
+          const fullCityList: import("../types").CityEntry[] = [];
           for (const sel of perStateCities) {
             fullCityList.push(...sel.rankedCities);
           }
@@ -514,12 +622,15 @@ startRouter.post('/', async (req: Request, res: Response): Promise<void> => {
           outer: while (batchPointer < totalCities) {
             if (stopSignal.stopped) break;
 
-            const batch = fullCityList.slice(batchPointer, batchPointer + CITY_BATCH_SIZE);
+            const batch = fullCityList.slice(
+              batchPointer,
+              batchPointer + CITY_BATCH_SIZE,
+            );
             batchPointer += CITY_BATCH_SIZE;
             currentBatch++;
 
             logger.info(
-              `Batch ${currentBatch}/${totalBatches}: [${batch.map((c) => c.name).join(', ')}]`
+              `Batch ${currentBatch}/${totalBatches}: [${batch.map((c) => c.name).join(", ")}]`,
             );
 
             // Filter out visited cities before dispatching
@@ -529,7 +640,7 @@ startRouter.post('/', async (req: Request, res: Response): Promise<void> => {
               if (isCityVisited(keyword, city.name, isoCountryCode)) {
                 logger.info(
                   `VisitedCities: skipping "${city.name}, ${city.state}" — ` +
-                  `already scraped for "${keyword}" within window`
+                    `already scraped for "${keyword}" within window`,
                 );
                 citiesProcessed++;
                 return false;
@@ -538,7 +649,8 @@ startRouter.post('/', async (req: Request, res: Response): Promise<void> => {
             });
 
             if (citiesToRun.length === 0) continue;
-            if (stopSignal.stopped || store.getLeadCount() >= maxLeads) break outer;
+            if (stopSignal.stopped || store.getLeadCount() >= maxLeads)
+              break outer;
 
             await runCitySlice(citiesToRun, currentBatch);
           }
@@ -546,14 +658,17 @@ startRouter.post('/', async (req: Request, res: Response): Promise<void> => {
 
         // ── Final status (shared by both paths) ─────────────────────────────
         const finalLeads = store.getLeadCount();
-        const wasStopped = stopSignal.stopped || store.getStatus() === 'stopped';
-        const finalStatus: 'completed' | 'stopped' = wasStopped ? 'stopped' : 'completed';
+        const wasStopped =
+          stopSignal.stopped || store.getStatus() === "stopped";
+        const finalStatus: "completed" | "stopped" = wasStopped
+          ? "stopped"
+          : "completed";
 
         if (!wasStopped && finalLeads < maxLeads) {
           logger.info(
             `All cities exhausted (${citiesProcessed}/${totalCities}). ` +
-            `Collected ${finalLeads}/${maxLeads} leads. ` +
-            `To get more leads, add more states or change the keyword.`
+              `Collected ${finalLeads}/${maxLeads} leads. ` +
+              `To get more leads, add more states or change the keyword.`,
           );
         } else if (!wasStopped) {
           logger.info(`Target reached: ${finalLeads} leads collected.`);
@@ -565,15 +680,26 @@ startRouter.post('/', async (req: Request, res: Response): Promise<void> => {
           status: finalStatus,
           leadCount: finalStats.leadCount,
           discardCount: finalStats.discardCount,
-          batchProgress: { currentBatch, totalBatches, citiesProcessed, totalCities },
+          batchProgress: {
+            currentBatch,
+            totalBatches,
+            citiesProcessed,
+            totalCities,
+          },
           roundRobinProgress: finalRRProgress,
         });
         closeSSEConnection(ctx.jobId);
       } catch (err) {
-        logger.error(`City-batched controller error: ${(err as Error).message}`);
-        store.setStatus('error');
+        logger.error(
+          `City-batched controller error: ${(err as Error).message}`,
+        );
+        store.setStatus("error");
         const stats = store.getStats();
-        emitStatus(ctx.jobId, { status: 'error', leadCount: stats.leadCount, discardCount: stats.discardCount });
+        emitStatus(ctx.jobId, {
+          status: "error",
+          leadCount: stats.leadCount,
+          discardCount: stats.discardCount,
+        });
         closeSSEConnection(ctx.jobId);
       }
     })();
@@ -588,11 +714,17 @@ startRouter.post('/', async (req: Request, res: Response): Promise<void> => {
     try {
       const geocodeResult = await geocodeLocation(loc);
       geocodeResults.set(loc, geocodeResult.isoCountryCode);
-      logger.info(`Geocode success: "${loc}" → ISO=${geocodeResult.isoCountryCode || '(unknown)'}`);
+      logger.info(
+        `Geocode success: "${loc}" → ISO=${geocodeResult.isoCountryCode || "(unknown)"}`,
+      );
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Location could not be resolved';
+      const message =
+        err instanceof Error ? err.message : "Location could not be resolved";
       logger.warn(`Geocode failed for "${loc}": ${message}`);
-      res.status(422).json({ error: 'invalid_location', message: `Location "${loc}": ${message}` });
+      res.status(422).json({
+        error: "invalid_location",
+        message: `Location "${loc}": ${message}`,
+      });
       return;
     }
   }
@@ -601,11 +733,11 @@ startRouter.post('/', async (req: Request, res: Response): Promise<void> => {
     keyword,
     locations[0],
     depth,
-    geocodeResults.get(locations[0]) ?? '',
+    geocodeResults.get(locations[0]) ?? "",
     contactFilter,
-    maxLeads
+    maxLeads,
   );
-  store.setStatus('running');
+  store.setStatus("running");
   logger.info(`Job initialised (legacy): jobId=${ctx.jobId}`);
   res.status(202).json({ jobId: ctx.jobId });
 
@@ -613,11 +745,11 @@ startRouter.post('/', async (req: Request, res: Response): Promise<void> => {
   (async () => {
     try {
       for (let i = 0; i < locations.length; i++) {
-        if (store.getStatus() === 'stopped') break;
+        if (store.getStatus() === "stopped") break;
         if (store.getLeadCount() >= maxLeads) break;
 
         const loc = locations[i];
-        const isoCode = geocodeResults.get(loc) ?? '';
+        const isoCode = geocodeResults.get(loc) ?? "";
         const iterCtx: JobContext = {
           jobId: ctx.jobId,
           keyword,
@@ -629,22 +761,28 @@ startRouter.post('/', async (req: Request, res: Response): Promise<void> => {
         };
 
         if (i > 0) {
-          store.setStatus('running');
+          store.setStatus("running");
           resetStopSignal();
         }
 
-        logger.info(`Legacy run ${i + 1}/${locations.length} — keyword="${keyword}" location="${loc}"`);
+        logger.info(
+          `Legacy run ${i + 1}/${locations.length} — keyword="${keyword}" location="${loc}"`,
+        );
 
         const isLastRun = i === locations.length - 1;
         await runPipeline(iterCtx, !isLastRun);
 
-        if (INTER_JOB_DELAY_MS > 0 && !isLastRun && store.getStatus() !== 'stopped') {
+        if (
+          INTER_JOB_DELAY_MS > 0 &&
+          !isLastRun &&
+          store.getStatus() !== "stopped"
+        ) {
           await sleep(INTER_JOB_DELAY_MS);
         }
       }
     } catch (err) {
       logger.error(`Legacy pipeline error: ${(err as Error).message}`);
-      store.setStatus('error');
+      store.setStatus("error");
     }
   })();
 });
