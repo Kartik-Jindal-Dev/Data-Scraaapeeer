@@ -3,7 +3,7 @@
 import { useState, useEffect, useRef, KeyboardEvent } from 'react';
 import { ContactFilter, ScrapeDepth, PROFESSION_LABELS } from '../types';
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? '';
+const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8080";
 
 interface CountryOption { name: string; isoCode: string; }
 interface StateOption   { name: string; isoCode: string; }

@@ -17,7 +17,7 @@ import {
   ErrorPayload,
 } from '../types';
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? '';
+const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8080";
 
 export default function DashboardPage() {
   // ── Form state (Phase 13) ───────────────────────────────────────────────────
