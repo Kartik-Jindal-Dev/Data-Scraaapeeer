@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/playwright:v1.45.1-jammy
+FROM mcr.microsoft.com/playwright:v1.59.1-jammy
 
 RUN apt-get update && apt-get install -y build-essential python3
 
